@@ -1,14 +1,14 @@
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::{Arc, RwLock},
+    collections::VecDeque,
     time::{Duration, Instant},
 };
 
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use sysinfo::System;
-use tokio::time::sleep;
+use sysinfo::{Disks, System};
+
+#[cfg(all(feature = "nvidia", any(target_os = "windows", target_os = "linux")))]
+use nvml_wrapper::Nvml;
 
 const HISTORY_SIZE: usize = 120;
 const REFRESH_INTERVAL_MS: u64 = 200;
@@ -51,76 +51,130 @@ impl Theme {
     }
 }
 
-// ================= Metrics =================
+// ================= Process Tracking =================
 
-#[derive(Clone, Default)]
-struct Metrics {
-    inner: Arc<RwLock<HashMap<String, JobStats>>>,
+#[derive(Clone)]
+struct ProcessInfo {
+    name: String,
+    cpu_usage: f32,
+    memory_kb: u64,
 }
 
-#[derive(Clone, Default)]
-struct JobStats {
-    total_runs: u64,
-    successful_runs: u64,
-    total_duration: Duration,
-    latency_history: VecDeque<f32>,
+// ================= Disk Stats =================
+
+#[derive(Clone)]
+struct DiskInfo {
+    mount_point: String,
+    total_space: u64,
+    available_space: u64,
+    usage_percent: f32,
+    file_system: String,
 }
 
-impl JobStats {
-    fn avg_latency_ms(&self) -> f32 {
-        if self.total_runs == 0 {
-            return 0.0;
-        }
-        self.total_duration.as_millis() as f32 / self.total_runs as f32
-    }
+// ================= CPU Info =================
 
-    fn success_rate(&self) -> f32 {
-        if self.total_runs == 0 {
-            return 0.0;
-        }
-        (self.successful_runs as f32 * 100.0) / self.total_runs as f32
-    }
-
-    fn current_latency_ms(&self) -> f32 {
-        self.latency_history.back().copied().unwrap_or(0.0)
-    }
-
-    fn min_latency_ms(&self) -> f32 {
-        self.latency_history
-            .iter()
-            .copied()
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap_or(0.0)
-    }
-
-    fn max_latency_ms(&self) -> f32 {
-        self.latency_history
-            .iter()
-            .copied()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap_or(0.0)
-    }
+#[derive(Clone)]
+struct CpuInfo {
+    physical_cores: usize,
+    logical_cores: usize,
+    smt_enabled: bool,
+    brand: String,
 }
 
-impl Metrics {
-    fn record(&self, job_name: &str, duration: Duration, success: bool) {
-        let mut metrics = self.inner.write().unwrap();
-        let stats = metrics.entry(job_name.to_string()).or_default();
+// ================= GPU Info =================
 
-        stats.total_runs += 1;
-        if success {
-            stats.successful_runs += 1;
-        }
-        stats.total_duration += duration;
+#[derive(Clone)]
+struct GpuInfo {
+    name: String,
+    utilization: f32,
+    memory_used: u64,
+    memory_total: u64,
+    temperature: Option<f32>,
+    power_usage: Option<f32>,
+}
 
-        if stats.latency_history.len() >= HISTORY_SIZE {
-            stats.latency_history.pop_front();
+struct GpuMonitor {
+    gpus: Vec<GpuInfo>,
+    gpu_history: Vec<VecDeque<f32>>,
+    #[cfg(all(feature = "nvidia", any(target_os = "windows", target_os = "linux")))]
+    nvml: Option<Nvml>,
+}
+
+impl GpuMonitor {
+    fn new() -> Self {
+        #[cfg(all(feature = "nvidia", any(target_os = "windows", target_os = "linux")))]
+        let nvml = Nvml::init().ok();
+
+        Self {
+            gpus: Vec::new(),
+            gpu_history: Vec::new(),
+            #[cfg(all(feature = "nvidia", any(target_os = "windows", target_os = "linux")))]
+            nvml,
         }
-        stats.latency_history.push_back(duration.as_millis() as f32);
     }
 
-    fn get_snapshot(&self) -> HashMap<String, JobStats> {
-        self.inner.read().unwrap().clone()
+    fn refresh(&mut self) {
+        self.gpus.clear();
+
+        #[cfg(all(feature = "nvidia", any(target_os = "windows", target_os = "linux")))]
+        if let Some(ref nvml) = self.nvml {
+            if let Ok(device_count) = nvml.device_count() {
+                for i in 0..device_count {
+                    if let Ok(device) = nvml.device_by_index(i) {
+                        let name = device.name().unwrap_or_else(|_| format!("GPU {}", i));
+
+                        let utilization = device
+                            .utilization_rates()
+                            .ok()
+                            .map(|u| u.gpu as f32)
+                            .unwrap_or(0.0);
+
+                        let memory_info = device.memory_info().ok();
+                        let memory_used = memory_info.as_ref().map(|m| m.used).unwrap_or(0);
+                        let memory_total = memory_info.as_ref().map(|m| m.total).unwrap_or(1);
+
+                        let temperature = device
+                            .temperature(
+                                nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu,
+                            )
+                            .ok()
+                            .map(|t| t as f32);
+
+                        let power_usage = device.power_usage().ok().map(|p| p as f32 / 1000.0); // Convert to watts
+
+                        let gpu = GpuInfo {
+                            name,
+                            utilization,
+                            memory_used,
+                            memory_total,
+                            temperature,
+                            power_usage,
+                        };
+
+                        self.gpus.push(gpu);
+                    }
+                }
+            }
+        }
+
+        // Ensure we have enough history vectors
+        while self.gpu_history.len() < self.gpus.len() {
+            self.gpu_history.push(VecDeque::with_capacity(HISTORY_SIZE));
+        }
+
+        // Update GPU history
+        for (i, gpu) in self.gpus.iter().enumerate() {
+            if let Some(history) = self.gpu_history.get_mut(i) {
+                if history.len() >= HISTORY_SIZE {
+                    history.pop_front();
+                }
+                history.push_back(gpu.utilization);
+            }
+        }
+    }
+
+    fn has_gpus(&self) -> bool {
+        !self.gpus.is_empty()
     }
 }
 
@@ -160,32 +214,65 @@ impl LayoutMode {
 // ================= App State =================
 
 struct SystemMonitor {
-    metrics: Metrics,
     system: System,
+    disks: Disks,
     cpu_history: Vec<VecDeque<f32>>,
     memory_history: VecDeque<f32>,
+    top_processes: Vec<ProcessInfo>,
+    total_processes: usize,
+    disk_stats: Vec<DiskInfo>,
+    cpu_info: CpuInfo,
+    gpu_monitor: GpuMonitor,
     last_refresh: Instant,
+    last_process_refresh: Instant,
     theme: Theme,
 }
 
 impl SystemMonitor {
-    fn new(metrics: Metrics) -> Self {
+    fn new() -> Self {
         let mut system = System::new_all();
-        system.refresh_cpu();
+
+        std::thread::sleep(Duration::from_millis(200));
+        system.refresh_cpu_all();
+        system.refresh_memory();
+
         let cpu_count = system.cpus().len();
+        let physical_cores = system.physical_core_count().unwrap_or(cpu_count);
+        let smt_enabled = cpu_count > physical_cores;
+
+        let cpu_brand = system
+            .cpus()
+            .first()
+            .map(|cpu| cpu.brand().to_string())
+            .unwrap_or_else(|| "Unknown CPU".to_string());
+
+        let cpu_info = CpuInfo {
+            physical_cores,
+            logical_cores: cpu_count,
+            smt_enabled,
+            brand: cpu_brand,
+        };
+
+        let disks = Disks::new_with_refreshed_list();
 
         Self {
-            metrics,
             system,
+            disks,
             cpu_history: vec![VecDeque::with_capacity(HISTORY_SIZE); cpu_count],
             memory_history: VecDeque::with_capacity(HISTORY_SIZE),
+            top_processes: Vec::new(),
+            total_processes: 0,
+            disk_stats: Vec::new(),
+            cpu_info,
+            gpu_monitor: GpuMonitor::new(),
             last_refresh: Instant::now(),
+            last_process_refresh: Instant::now(),
             theme: Theme::dark(),
         }
     }
 
     fn refresh_system_stats(&mut self) {
-        self.system.refresh_cpu();
+        self.system.refresh_cpu_all();
         self.system.refresh_memory();
 
         // Update CPU history
@@ -205,6 +292,73 @@ impl SystemMonitor {
             self.memory_history.pop_front();
         }
         self.memory_history.push_back(mem_usage);
+
+        // Refresh process stats less frequently (every 2 seconds)
+        if self.last_process_refresh.elapsed() >= Duration::from_secs(2) {
+            self.refresh_process_stats();
+            self.refresh_disk_stats();
+            self.gpu_monitor.refresh();
+            self.last_process_refresh = Instant::now();
+        }
+    }
+
+    fn refresh_process_stats(&mut self) {
+        self.system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::new().with_cpu().with_memory(),
+        );
+
+        let mut processes: Vec<ProcessInfo> = self
+            .system
+            .processes()
+            .iter()
+            .map(|(_, process)| ProcessInfo {
+                name: process.name().to_string_lossy().to_string(),
+                cpu_usage: process.cpu_usage(),
+                memory_kb: process.memory() / 1024,
+            })
+            .collect();
+
+        // Sort by CPU usage
+        processes.sort_by(|a, b| {
+            b.cpu_usage
+                .partial_cmp(&a.cpu_usage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Keep top 5 processes
+        processes.truncate(5);
+
+        self.total_processes = self.system.processes().len();
+        self.top_processes = processes;
+    }
+
+    fn refresh_disk_stats(&mut self) {
+        self.disks.refresh_list();
+
+        self.disk_stats = self
+            .disks
+            .iter()
+            .map(|disk| {
+                let total = disk.total_space();
+                let available = disk.available_space();
+                let used = total.saturating_sub(available);
+                let usage_percent = if total > 0 {
+                    (used as f64 / total as f64 * 100.0) as f32
+                } else {
+                    0.0
+                };
+
+                DiskInfo {
+                    mount_point: disk.mount_point().to_string_lossy().to_string(),
+                    total_space: total,
+                    available_space: available,
+                    usage_percent,
+                    file_system: disk.file_system().to_string_lossy().to_string(),
+                }
+            })
+            .collect();
     }
 
     fn avg_cpu_usage(&self) -> f32 {
@@ -227,11 +381,16 @@ impl SystemMonitor {
     }
 
     fn memory_used_gb(&self) -> f32 {
-        self.system.used_memory() as f32 / 1_048_576.0
+        self.system.used_memory() as f32 / (1024.0 * 1024.0 * 1024.0)
     }
 
     fn memory_total_gb(&self) -> f32 {
-        self.system.total_memory() as f32 / 1_048_576.0
+        self.system.total_memory() as f32 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    fn format_bytes_to_gb(bytes: u64) -> String {
+        let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        format!("{:.1} GB", gb)
     }
 }
 
@@ -254,21 +413,18 @@ impl eframe::App for SystemMonitor {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // Calculate responsive layout with proper margins
                         let available_width = ui.available_width();
                         let content_width = (available_width - (SIDE_PADDING * 2.0))
                             .min(MAX_CONTENT_WIDTH)
                             .max(300.0);
                         let layout_mode = LayoutMode::from_width(content_width);
 
-                        // Center and constrain content
                         ui.allocate_ui_with_layout(
                             egui::vec2(available_width, ui.available_height()),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
                                 ui.add_space(24.0);
 
-                                // Main content container with fixed width
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(content_width, ui.available_height()),
                                     egui::Layout::top_down(egui::Align::LEFT),
@@ -284,7 +440,15 @@ impl eframe::App for SystemMonitor {
                                         ui.add_space(24.0);
                                         self.render_memory_section(ui, layout_mode);
                                         ui.add_space(24.0);
-                                        self.render_jobs_section(ui, layout_mode);
+                                        self.render_process_section(ui, layout_mode);
+                                        ui.add_space(24.0);
+
+                                        if self.gpu_monitor.has_gpus() {
+                                            self.render_gpu_section(ui, layout_mode);
+                                            ui.add_space(24.0);
+                                        }
+
+                                        self.render_disk_section(ui, layout_mode);
                                         ui.add_space(48.0);
                                     },
                                 );
@@ -305,7 +469,6 @@ impl SystemMonitor {
         style.visuals.widgets.inactive.bg_fill = self.theme.bg_card;
         style.visuals.extreme_bg_color = self.theme.bg_secondary;
 
-        // Smooth scrolling
         style.spacing.scroll = egui::style::ScrollStyle {
             bar_width: 6.0,
             ..Default::default()
@@ -333,10 +496,9 @@ impl SystemMonitor {
 
     fn render_stats_overview(&self, ui: &mut egui::Ui, layout: LayoutMode) {
         let cards_per_row = layout.stats_cards_per_row();
-        let job_count = self.metrics.get_snapshot().len();
+        let process_count = self.total_processes;
 
         if cards_per_row == 1 {
-            // Mobile: Stack vertically
             let width = ui.available_width();
             self.render_stat_card(
                 ui,
@@ -359,12 +521,11 @@ impl SystemMonitor {
             self.render_stat_card(
                 ui,
                 width,
-                "Active Jobs",
-                job_count.to_string(),
+                "Processes",
+                process_count.to_string(),
                 self.theme.success,
             );
         } else {
-            // Desktop/Tablet: Horizontal layout
             let available = ui.available_width();
             let spacing = 12.0;
             let total_spacing = spacing * (cards_per_row - 1) as f32;
@@ -392,8 +553,8 @@ impl SystemMonitor {
                 self.render_stat_card(
                     ui,
                     card_width,
-                    "Active Jobs",
-                    job_count.to_string(),
+                    "Processes",
+                    process_count.to_string(),
                     self.theme.success,
                 );
             });
@@ -430,7 +591,58 @@ impl SystemMonitor {
 
     fn render_cpu_section(&self, ui: &mut egui::Ui, layout: LayoutMode) {
         self.render_card(ui, |ui| {
-            self.render_section_header(ui, "CPU Cores", "Per-core utilization");
+            self.render_section_header(ui, "CPU", "Processor utilization");
+            ui.add_space(12.0);
+
+            // CPU Info
+            egui::Frame::none()
+                .fill(self.theme.bg_secondary)
+                .rounding(8.0)
+                .inner_margin(12.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(&self.cpu_info.brand)
+                            .size(13.0)
+                            .color(self.theme.text_secondary),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 16.0;
+
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Physical: {} cores",
+                                self.cpu_info.physical_cores
+                            ))
+                            .size(12.0)
+                            .color(self.theme.text_secondary),
+                        );
+
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Logical: {} CPUs",
+                                self.cpu_info.logical_cores
+                            ))
+                            .size(12.0)
+                            .color(self.theme.text_secondary),
+                        );
+
+                        if self.cpu_info.smt_enabled {
+                            ui.label(
+                                egui::RichText::new("SMT: Enabled")
+                                    .size(12.0)
+                                    .color(self.theme.success),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("SMT: Disabled")
+                                    .size(12.0)
+                                    .color(self.theme.text_secondary),
+                            );
+                        }
+                    });
+                });
+
             ui.add_space(20.0);
 
             for (i, history) in self.cpu_history.iter().enumerate() {
@@ -455,7 +667,6 @@ impl SystemMonitor {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
 
-            // Core label - fixed width
             ui.add_sized(
                 [70.0, 24.0],
                 egui::Label::new(
@@ -465,7 +676,6 @@ impl SystemMonitor {
                 ),
             );
 
-            // Calculate remaining space for progress bar
             let sparkline_width = if show_sparkline {
                 (available * 0.25).max(100.0).min(200.0)
             } else {
@@ -481,7 +691,6 @@ impl SystemMonitor {
             let spacing_count = if show_sparkline { 3.0 } else { 2.0 };
             let progress_width = (available - used_width - (10.0 * spacing_count)).max(100.0);
 
-            // Progress bar
             ui.add_sized(
                 [progress_width, 24.0],
                 egui::ProgressBar::new(usage / 100.0)
@@ -489,7 +698,6 @@ impl SystemMonitor {
                     .rounding(6.0),
             );
 
-            // Percentage - fixed width
             ui.add_sized(
                 [55.0, 24.0],
                 egui::Label::new(
@@ -500,7 +708,6 @@ impl SystemMonitor {
                 ),
             );
 
-            // Sparkline (only on larger screens)
             if show_sparkline {
                 self.render_sparkline(
                     ui,
@@ -520,7 +727,6 @@ impl SystemMonitor {
 
             let usage_pct = self.memory_usage_percent();
 
-            // Memory bar
             ui.add(
                 egui::ProgressBar::new(usage_pct / 100.0)
                     .desired_width(ui.available_width())
@@ -531,11 +737,10 @@ impl SystemMonitor {
 
             ui.add_space(12.0);
 
-            // Memory stats
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "{:.2} GB / {:.2} GB",
+                        "{:.1} GB / {:.1} GB",
                         self.memory_used_gb(),
                         self.memory_total_gb()
                     ))
@@ -555,7 +760,6 @@ impl SystemMonitor {
 
             ui.add_space(16.0);
 
-            // Memory history chart
             let chart_height = match layout {
                 LayoutMode::Desktop => 120.0,
                 LayoutMode::Tablet => 100.0,
@@ -570,157 +774,320 @@ impl SystemMonitor {
         });
     }
 
-    fn render_jobs_section(&self, ui: &mut egui::Ui, layout: LayoutMode) {
+    fn render_process_section(&self, ui: &mut egui::Ui, _layout: LayoutMode) {
         self.render_card(ui, |ui| {
-            self.render_section_header(ui, "Job Performance", "Latency and success metrics");
+            self.render_section_header(ui, "Processes", "Active system processes");
             ui.add_space(20.0);
 
-            let jobs = self.metrics.get_snapshot();
+            ui.label(
+                egui::RichText::new(format!("Total: {} processes", self.total_processes))
+                    .size(13.0)
+                    .color(self.theme.text_secondary),
+            );
 
-            if jobs.is_empty() {
+            ui.add_space(16.0);
+
+            ui.label(
+                egui::RichText::new("Top CPU Consumers")
+                    .size(14.0)
+                    .strong()
+                    .color(self.theme.text_primary),
+            );
+            ui.add_space(10.0);
+
+            if self.top_processes.is_empty() {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(32.0);
+                    ui.add_space(20.0);
                     ui.label(
-                        egui::RichText::new("No active jobs")
+                        egui::RichText::new("No process data available")
+                            .size(13.0)
+                            .color(self.theme.text_secondary),
+                    );
+                    ui.add_space(20.0);
+                });
+            } else {
+                for process in &self.top_processes {
+                    self.render_process_item(ui, process);
+                    ui.add_space(8.0);
+                }
+            }
+        });
+    }
+
+    fn render_process_item(&self, ui: &mut egui::Ui, process: &ProcessInfo) {
+        egui::Frame::none()
+            .fill(self.theme.bg_secondary)
+            .rounding(6.0)
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let max_name_width = ui.available_width() * 0.6;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(max_name_width, 20.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new(&process.name)
+                                    .size(13.0)
+                                    .color(self.theme.text_primary),
+                            );
+                        },
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.1} MB",
+                                process.memory_kb as f32 / 1024.0
+                            ))
+                            .size(12.0)
+                            .color(self.theme.text_secondary),
+                        );
+
+                        ui.add_space(12.0);
+
+                        ui.label(
+                            egui::RichText::new(format!("{:.1}%", process.cpu_usage))
+                                .size(12.0)
+                                .strong()
+                                .color(self.theme.accent_primary),
+                        );
+                    });
+                });
+            });
+    }
+
+    fn render_gpu_section(&self, ui: &mut egui::Ui, layout: LayoutMode) {
+        self.render_card(ui, |ui| {
+            self.render_section_header(ui, "GPU", "Graphics processor utilization");
+            ui.add_space(20.0);
+
+            for (i, gpu) in self.gpu_monitor.gpus.iter().enumerate() {
+                self.render_gpu_item(ui, i, gpu, layout);
+                if i < self.gpu_monitor.gpus.len() - 1 {
+                    ui.add_space(16.0);
+                }
+            }
+        });
+    }
+
+    fn render_gpu_item(&self, ui: &mut egui::Ui, index: usize, gpu: &GpuInfo, layout: LayoutMode) {
+        egui::Frame::none()
+            .fill(self.theme.bg_secondary)
+            .rounding(8.0)
+            .inner_margin(14.0)
+            .show(ui, |ui| {
+                // GPU name header
+                ui.label(
+                    egui::RichText::new(&gpu.name)
+                        .size(15.0)
+                        .strong()
+                        .color(self.theme.text_primary),
+                );
+
+                ui.add_space(12.0);
+
+                // GPU utilization bar
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("GPU:")
+                            .size(13.0)
+                            .color(self.theme.text_secondary),
+                    );
+
+                    let available = ui.available_width() - 60.0;
+                    ui.add_sized(
+                        [available, 24.0],
+                        egui::ProgressBar::new(gpu.utilization / 100.0)
+                            .fill(self.get_usage_color(gpu.utilization))
+                            .rounding(6.0),
+                    );
+
+                    ui.add_sized(
+                        [50.0, 24.0],
+                        egui::Label::new(
+                            egui::RichText::new(format!("{:.0}%", gpu.utilization))
+                                .size(13.0)
+                                .monospace()
+                                .color(self.theme.text_primary),
+                        ),
+                    );
+                });
+
+                ui.add_space(10.0);
+
+                // VRAM usage bar
+                let vram_percent = if gpu.memory_total > 0 {
+                    (gpu.memory_used as f64 / gpu.memory_total as f64 * 100.0) as f32
+                } else {
+                    0.0
+                };
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("VRAM:")
+                            .size(13.0)
+                            .color(self.theme.text_secondary),
+                    );
+
+                    let available = ui.available_width() - 110.0;
+                    ui.add_sized(
+                        [available, 24.0],
+                        egui::ProgressBar::new(vram_percent / 100.0)
+                            .fill(self.get_usage_color(vram_percent))
+                            .rounding(6.0),
+                    );
+
+                    ui.add_sized(
+                        [105.0, 24.0],
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "{:.1}/{:.1} GB",
+                                gpu.memory_used as f64 / (1024.0 * 1024.0 * 1024.0),
+                                gpu.memory_total as f64 / (1024.0 * 1024.0 * 1024.0)
+                            ))
+                            .size(12.0)
+                            .monospace()
+                            .color(self.theme.text_primary),
+                        ),
+                    );
+                });
+
+                ui.add_space(12.0);
+
+                // Additional stats
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+
+                    if let Some(temp) = gpu.temperature {
+                        egui::Frame::none()
+                            .fill(self.theme.bg_card)
+                            .rounding(6.0)
+                            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("Temp: {:.0}°C", temp))
+                                        .size(12.0)
+                                        .color(if temp > 80.0 {
+                                            self.theme.danger
+                                        } else if temp > 70.0 {
+                                            self.theme.warning
+                                        } else {
+                                            self.theme.text_secondary
+                                        }),
+                                );
+                            });
+                    }
+
+                    if let Some(power) = gpu.power_usage {
+                        egui::Frame::none()
+                            .fill(self.theme.bg_card)
+                            .rounding(6.0)
+                            .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("Power: {:.0}W", power))
+                                        .size(12.0)
+                                        .color(self.theme.text_secondary),
+                                );
+                            });
+                    }
+                });
+
+                // GPU utilization history chart
+                if let Some(history) = self.gpu_monitor.gpu_history.get(index) {
+                    if !history.is_empty() {
+                        ui.add_space(14.0);
+                        let chart_height = match layout {
+                            LayoutMode::Desktop => 90.0,
+                            LayoutMode::Tablet => 80.0,
+                            LayoutMode::Mobile => 70.0,
+                        };
+                        self.render_chart(ui, history, format!("gpu_{}", index), chart_height);
+                    }
+                }
+            });
+    }
+
+    fn render_disk_section(&self, ui: &mut egui::Ui, _layout: LayoutMode) {
+        self.render_card(ui, |ui| {
+            self.render_section_header(ui, "Storage", "Disk usage");
+            ui.add_space(20.0);
+
+            if self.disk_stats.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(20.0);
+                    ui.label(
+                        egui::RichText::new("No disks detected")
                             .size(14.0)
                             .color(self.theme.text_secondary),
                     );
-                    ui.add_space(32.0);
+                    ui.add_space(20.0);
                 });
                 return;
             }
 
-            for (name, stats) in jobs {
-                self.render_job_card(ui, &name, &stats, layout);
+            for disk in &self.disk_stats {
+                self.render_disk_item(ui, disk);
                 ui.add_space(16.0);
             }
         });
     }
 
-    fn render_job_card(&self, ui: &mut egui::Ui, name: &str, stats: &JobStats, layout: LayoutMode) {
+    fn render_disk_item(&self, ui: &mut egui::Ui, disk: &DiskInfo) {
         egui::Frame::none()
             .fill(self.theme.bg_secondary)
             .rounding(8.0)
-            .inner_margin(16.0)
-            .stroke(egui::Stroke::new(1.0, self.theme.border))
+            .inner_margin(14.0)
             .show(ui, |ui| {
-                // Job header
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(name)
-                            .size(16.0)
+                        egui::RichText::new(&disk.mount_point)
+                            .size(14.0)
                             .strong()
                             .color(self.theme.text_primary),
                     );
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let success_rate = stats.success_rate();
-                        let color = self.get_status_color(success_rate);
-
                         ui.label(
-                            egui::RichText::new(format!("{:.1}%", success_rate))
-                                .size(14.0)
-                                .strong()
-                                .color(color),
+                            egui::RichText::new(&disk.file_system)
+                                .size(11.0)
+                                .color(self.theme.text_secondary),
                         );
                     });
                 });
 
-                ui.add_space(14.0);
+                ui.add_space(10.0);
 
-                // Metrics pills
-                match layout {
-                    LayoutMode::Mobile => {
-                        ui.vertical(|ui| {
-                            self.render_metric_pill(
-                                ui,
-                                "Avg",
-                                format!("{:.0}ms", stats.avg_latency_ms()),
-                            );
-                            ui.add_space(8.0);
-                            self.render_metric_pill(
-                                ui,
-                                "Current",
-                                format!("{:.0}ms", stats.current_latency_ms()),
-                            );
-                            ui.add_space(8.0);
-                            self.render_metric_pill(
-                                ui,
-                                "Min/Max",
-                                format!(
-                                    "{:.0}/{:.0}ms",
-                                    stats.min_latency_ms(),
-                                    stats.max_latency_ms()
-                                ),
-                            );
-                            ui.add_space(8.0);
-                            self.render_metric_pill(ui, "Runs", stats.total_runs.to_string());
-                        });
-                    }
-                    _ => {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.spacing_mut().item_spacing.y = 8.0;
-                            self.render_metric_pill(
-                                ui,
-                                "Avg",
-                                format!("{:.0}ms", stats.avg_latency_ms()),
-                            );
-                            self.render_metric_pill(
-                                ui,
-                                "Current",
-                                format!("{:.0}ms", stats.current_latency_ms()),
-                            );
-                            self.render_metric_pill(
-                                ui,
-                                "Min/Max",
-                                format!(
-                                    "{:.0}/{:.0}ms",
-                                    stats.min_latency_ms(),
-                                    stats.max_latency_ms()
-                                ),
-                            );
-                            self.render_metric_pill(ui, "Runs", stats.total_runs.to_string());
-                        });
-                    }
-                }
-
-                ui.add_space(14.0);
-
-                // Latency chart
-                let chart_height = match layout {
-                    LayoutMode::Desktop => 90.0,
-                    LayoutMode::Tablet => 80.0,
-                    LayoutMode::Mobile => 70.0,
-                };
-                self.render_chart(
-                    ui,
-                    &stats.latency_history,
-                    format!("job_{}", name),
-                    chart_height,
+                ui.add(
+                    egui::ProgressBar::new(disk.usage_percent / 100.0)
+                        .desired_width(ui.available_width())
+                        .desired_height(24.0)
+                        .fill(self.get_usage_color(disk.usage_percent))
+                        .rounding(6.0),
                 );
-            });
-    }
 
-    fn render_metric_pill(&self, ui: &mut egui::Ui, label: &str, value: String) {
-        egui::Frame::none()
-            .fill(self.theme.bg_card)
-            .rounding(6.0)
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-            .show(ui, |ui| {
+                ui.add_space(8.0);
+
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let used = disk.total_space.saturating_sub(disk.available_space);
                     ui.label(
-                        egui::RichText::new(format!("{}:", label))
-                            .size(11.0)
-                            .color(self.theme.text_secondary),
+                        egui::RichText::new(format!(
+                            "{} / {}",
+                            Self::format_bytes_to_gb(used),
+                            Self::format_bytes_to_gb(disk.total_space)
+                        ))
+                        .size(12.0)
+                        .color(self.theme.text_secondary),
                     );
-                    ui.label(
-                        egui::RichText::new(value)
-                            .size(12.0)
-                            .strong()
-                            .color(self.theme.text_primary),
-                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:.1}% used", disk.usage_percent))
+                                .size(12.0)
+                                .color(self.theme.text_primary),
+                        );
+                    });
                 });
             });
     }
@@ -811,40 +1178,11 @@ impl SystemMonitor {
             self.theme.accent_primary
         }
     }
-
-    fn get_status_color(&self, success_rate: f32) -> egui::Color32 {
-        if success_rate >= 95.0 {
-            self.theme.success
-        } else if success_rate >= 80.0 {
-            self.theme.warning
-        } else {
-            self.theme.danger
-        }
-    }
 }
 
 // ================= Main Entry Point =================
 
-#[tokio::main]
-async fn main() {
-    let metrics = Metrics::default();
-
-    // Spawn background job simulator
-    let metrics_clone = metrics.clone();
-    tokio::spawn(async move {
-        let mut rng = StdRng::from_entropy();
-
-        loop {
-            let latency_ms = rng.gen_range(50..500);
-            let duration = Duration::from_millis(latency_ms);
-            let success = rng.gen_bool(0.85); // 85% success rate
-
-            metrics_clone.record("api_requests", duration, success);
-            sleep(Duration::from_millis(500)).await;
-        }
-    });
-
-    // Launch GUI with optimized settings
+fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 800.0])
@@ -856,7 +1194,6 @@ async fn main() {
     eframe::run_native(
         "System Monitor Pro",
         options,
-        Box::new(|_cc| Box::new(SystemMonitor::new(metrics))),
+        Box::new(|_cc| Ok(Box::new(SystemMonitor::new()))),
     )
-    .expect("Failed to launch application");
 }
