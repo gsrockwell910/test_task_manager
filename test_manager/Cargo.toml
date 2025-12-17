@@ -1,0 +1,11 @@
+[package]
+name = "test_manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.27", features = ["default"] }
+egui_plot = "0.27"
+sysinfo = "0.30"
+tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "time"] }
+rand = "0.8"

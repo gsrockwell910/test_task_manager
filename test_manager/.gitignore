@@ -1,0 +1,64 @@
+# ===============================
+# Rust / Cargo
+# ===============================
+target/
+target/release
+
+# If this is a binary application, you may want to COMMIT Cargo.lock.
+# If so, remove Cargo.lock from this file.
+
+# ===============================
+# Build artifacts / profiling
+# ===============================
+**/*.rs.bk
+*.prof
+*.flamegraph
+*.perf
+*.dSYM/
+*.pdb
+
+# ===============================
+# Logs & runtime files
+# ===============================
+*.log
+*.trace
+
+# ===============================
+# OS generated files
+# ===============================
+.DS_Store
+.DS_Store?
+Thumbs.db
+desktop.ini
+
+# ===============================
+# Editor / IDE files
+# ===============================
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+
+# ===============================
+# EgGui / Eframe runtime state
+# ===============================
+egui.ini
+
+# ===============================
+# Environment / secrets
+# ===============================
+.env
+.env.*
+
+# ===============================
+# Optional: coverage reports
+# ===============================
+coverage/
+tarpaulin-report.html
+
+# ===============================
+# Optional: crash dumps
+# ===============================
+crash.log
+core.*
