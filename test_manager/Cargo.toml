@@ -1,33 +1,37 @@
 [package]
-name = "test_manager"
-version = "0.1.0"
-edition = "2024"
+name = "system-monitor-pro"
+version = "0.2.0"
+edition = "2021"
+authors = ["Your Name <you@example.com>"]
+description = "A real-time system monitoring application with GPU support"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
-eframe = "0.29.1"
-egui = "0.29.1"
-egui_plot = "0.29.0"
-sysinfo = "0.32.0"
+eframe = "0.29"
+egui = "0.29"
+egui_plot = "0.29"
+sysinfo = "0.32"
+battery = "0.7"
 
-# GPU monitoring dependencies
-[target.'cfg(target_os = "windows")'.dependencies]
-nvml-wrapper = { version = "0.10", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-nvml-wrapper = { version = "0.10", optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-metal = { version = "0.29", optional = true }
-core-foundation = { version = "0.9", optional = true }
-io-kit-sys = { version = "0.4", optional = true }
+# GPU support (optional, for NVIDIA)
+[dependencies.nvml-wrapper]
+version = "0.10"
+optional = true
 
 [features]
 default = []
 nvidia = ["nvml-wrapper"]
-apple-gpu = ["metal", "core-foundation", "io-kit-sys"]
 
+# Platform-specific optimizations
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.dev]
+opt-level = 1
+
+# Metadata
+[package.metadata.docs.rs]
+all-features = true
