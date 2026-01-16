@@ -1,10 +1,7 @@
 [package]
-name = "system-monitor-pro"
+name = "system_monitor_pro"
 version = "0.2.0"
 edition = "2021"
-authors = ["Your Name <you@example.com>"]
-description = "A real-time system monitoring application with GPU support"
-license = "MIT OR Apache-2.0"
 
 [dependencies]
 eframe = "0.29"
@@ -13,25 +10,15 @@ egui_plot = "0.29"
 sysinfo = "0.32"
 battery = "0.7"
 
-# GPU support (optional, for NVIDIA)
-[dependencies.nvml-wrapper]
-version = "0.10"
-optional = true
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+nvml-wrapper = { version = "0.10", optional = true }
 
 [features]
 default = []
 nvidia = ["nvml-wrapper"]
 
-# Platform-specific optimizations
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-
-[profile.dev]
-opt-level = 1
-
-# Metadata
-[package.metadata.docs.rs]
-all-features = true

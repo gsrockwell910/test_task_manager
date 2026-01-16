@@ -2981,7 +2981,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "system-monitor-pro"
+name = "system_monitor_pro"
 version = "0.2.0"
 dependencies = [
  "battery",
