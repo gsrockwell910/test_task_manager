@@ -245,7 +245,7 @@ struct NpuInfo {
 struct GpuMonitor {
     gpus: Vec<GpuInfo>,
     gpu_history: Vec<VecDeque<f32>>,
-    last_gpu_times: Vec<u64>, // Track cumulative engine times for delta calculation
+    last_gpu_times: Vec<u64>,
     last_update: Instant,
     #[cfg(all(feature = "nvidia", any(target_os = "windows", target_os = "linux")))]
     nvml: Option<Nvml>,
@@ -305,7 +305,6 @@ impl GpuMonitor {
     fn refresh_intel_gpu_windows(&mut self) {
         use std::process::Command;
 
-        // Try using Windows Performance Counters via typeperf
         let output = Command::new("typeperf")
             .args(&[
                 r"\GPU Engine(*engtype_3D)\Utilization Percentage",
@@ -318,13 +317,11 @@ impl GpuMonitor {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
 
-                // Parse the output to find Intel GPU utilization
                 for line in stdout.lines().skip(2) {
                     if line.contains("intel") || line.contains("Intel") {
                         let parts: Vec<&str> = line.split(',').collect();
                         if parts.len() >= 2 {
                             if let Ok(util) = parts[1].trim().trim_matches('"').parse::<f32>() {
-                                // Check if we already have this GPU
                                 if !self
                                     .gpus
                                     .iter()
@@ -340,7 +337,6 @@ impl GpuMonitor {
                                         is_integrated: true,
                                     });
                                 } else {
-                                    // Update existing
                                     if let Some(gpu) = self
                                         .gpus
                                         .iter_mut()
@@ -363,7 +359,6 @@ impl GpuMonitor {
         use std::fs;
         use std::path::Path;
 
-        // Intel GPUs expose metrics via debugfs and sysfs
         let intel_gpu_paths = [
             "/sys/class/drm/card0",
             "/sys/class/drm/card1",
@@ -376,11 +371,9 @@ impl GpuMonitor {
                 continue;
             }
 
-            // Check if it's an Intel GPU
             let vendor_path = path.join("device/vendor");
             if let Ok(vendor) = fs::read_to_string(&vendor_path) {
                 let vendor = vendor.trim();
-                // Intel vendor ID is 0x8086
                 if vendor != "0x8086" {
                     continue;
                 }
@@ -388,14 +381,12 @@ impl GpuMonitor {
                 continue;
             }
 
-            // Get GPU name - read device ID for better identification
             let device_path = path.join("device");
             let device_id = fs::read_to_string(device_path.join("device"))
                 .ok()
                 .and_then(|s| s.trim().to_string().into());
 
             let name = if let Some(dev_id) = device_id.as_ref() {
-                // Meteor Lake iGPU device IDs
                 match dev_id.as_str() {
                     "0x7d45" | "0x7d55" | "0x7dd5" => {
                         "Intel Arc Graphics (Meteor Lake)".to_string()
@@ -421,22 +412,16 @@ impl GpuMonitor {
                 "Intel Integrated Graphics".to_string()
             };
 
-            // Skip if already tracked
             if self.gpus.iter().any(|g| g.name == name) {
                 continue;
             }
 
-            // Try to read GPU utilization - multiple methods for Arc/Xe graphics
             let mut utilization = 0.0;
             let mut utilization_found = false;
 
-            // Get card name for sysfs paths
             let card_name = card_path.strip_prefix("/sys/class/drm/").unwrap_or("card0");
-
-            // Calculate time delta for rate-based measurements
             let time_delta = self.last_update.elapsed().as_secs_f32().max(0.01);
 
-            // Method 1: MOST RELIABLE - Calculate utilization from engine time delta
             let mut total_engine_ns = 0u64;
             let mut process_count = 0;
 
@@ -446,10 +431,8 @@ impl GpuMonitor {
                     if let Ok(fdinfo_entries) = fs::read_dir(&fdinfo_path) {
                         for fdinfo_entry in fdinfo_entries.flatten() {
                             if let Ok(content) = fs::read_to_string(fdinfo_entry.path()) {
-                                // Must check it's i915 driver
                                 if content.contains("drm-driver:\ti915") || content.contains("i915")
                                 {
-                                    // Parse render engine time
                                     for line in content.lines() {
                                         if line.starts_with("drm-engine-render:")
                                             || line.starts_with("drm-engine-rcs0:")
@@ -474,7 +457,6 @@ impl GpuMonitor {
                 }
             }
 
-            // Calculate utilization from time delta if we have previous data
             let gpu_index = self.gpus.iter().filter(|g| g.is_integrated).count();
 
             if let Some(last_time) = self.last_gpu_times.get(gpu_index) {
@@ -482,9 +464,6 @@ impl GpuMonitor {
                     let time_delta_ns = total_engine_ns - last_time;
                     let time_delta_secs = time_delta;
 
-                    // Convert nanoseconds of GPU time to percentage
-                    // time_delta_ns is how much GPU time was used
-                    // time_delta_secs is how much real time passed
                     let gpu_time_secs = time_delta_ns as f32 / 1_000_000_000.0;
                     utilization = (gpu_time_secs / time_delta_secs * 100.0).clamp(0.0, 100.0);
 
@@ -494,14 +473,12 @@ impl GpuMonitor {
                 }
             }
 
-            // Store current time for next delta calculation
             if self.last_gpu_times.len() > gpu_index {
                 self.last_gpu_times[gpu_index] = total_engine_ns;
             } else {
                 self.last_gpu_times.push(total_engine_ns);
             }
 
-            // Method 2: Frequency-based with MUCH more aggressive scaling
             if !utilization_found || utilization < 5.0 {
                 let gt_tile_path = device_path.join("gt/gt0");
                 if gt_tile_path.exists() {
@@ -509,7 +486,6 @@ impl GpuMonitor {
 
                     if let Ok(freq_act_str) = fs::read_to_string(&freq_act_path) {
                         if let Ok(act) = freq_act_str.trim().parse::<f32>() {
-                            // Read all frequency bounds
                             let min = fs::read_to_string(gt_tile_path.join("freq_min"))
                                 .or_else(|_| {
                                     fs::read_to_string(gt_tile_path.join("rps_RPn_freq_mhz"))
@@ -528,11 +504,9 @@ impl GpuMonitor {
                                 .unwrap_or(2000.0);
 
                             if act > min + 50.0 {
-                                // If frequency is elevated at all
                                 let base_pct =
                                     ((act - min) / (max - min) * 100.0).clamp(0.0, 100.0);
 
-                                // Super aggressive scaling
                                 let freq_util = if base_pct < 10.0 {
                                     base_pct * 3.0
                                 } else if base_pct < 30.0 {
@@ -553,7 +527,6 @@ impl GpuMonitor {
                 }
             }
 
-            // Method 3: Direct busy reading
             if !utilization_found || utilization < 5.0 {
                 for engine in ["rcs0", "rcs", "render"] {
                     let busy_path = format!("/sys/class/drm/{}/engine/{}/busy", card_name, engine);
@@ -569,116 +542,18 @@ impl GpuMonitor {
                 }
             }
 
-            // If we detected ANY activity (processes, frequency, etc), ensure minimum utilization
             if (process_count > 0 || total_engine_ns > 100_000_000) && utilization < 5.0 {
-                utilization = 15.0; // Minimum showing for detected activity
+                utilization = 15.0;
             }
 
-            // Method 3: Legacy gt path
-            if !utilization_found {
-                let gt_path_legacy = device_path.join("gt");
-                if gt_path_legacy.exists() {
-                    if let Ok(entries) = fs::read_dir(&gt_path_legacy) {
-                        for entry in entries.flatten() {
-                            let entry_path = entry.path();
-                            let freq_act_path = entry_path.join("freq_act");
-                            let freq_max_path = entry_path.join("freq_max");
-
-                            if freq_act_path.exists() && freq_max_path.exists() {
-                                if let (Ok(freq_act), Ok(freq_max)) = (
-                                    fs::read_to_string(&freq_act_path),
-                                    fs::read_to_string(&freq_max_path),
-                                ) {
-                                    if let (Ok(act), Ok(max)) = (
-                                        freq_act.trim().parse::<f32>(),
-                                        freq_max.trim().parse::<f32>(),
-                                    ) {
-                                        if max > 0.0 {
-                                            utilization = (act / max * 100.0).min(100.0);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Method 4: Read from drm fdinfo (most reliable for modern kernels)
-            // This requires reading from /proc/<pid>/fdinfo for processes using the GPU
-            if utilization == 0.0 {
-                if let Ok(proc_entries) = fs::read_dir("/proc") {
-                    let mut total_engine_time = 0u64;
-                    for proc_entry in proc_entries.flatten() {
-                        if let Ok(fdinfo_dir) = fs::read_dir(proc_entry.path().join("fdinfo")) {
-                            for fd_entry in fdinfo_dir.flatten() {
-                                if let Ok(fdinfo) = fs::read_to_string(fd_entry.path()) {
-                                    // Look for drm-engine-render lines
-                                    for line in fdinfo.lines() {
-                                        if line.starts_with(&format!("drm-engine-render:")) {
-                                            if let Some(time_str) = line.split(':').nth(1) {
-                                                if let Ok(time_ns) = time_str
-                                                    .trim()
-                                                    .split_whitespace()
-                                                    .next()
-                                                    .unwrap_or("0")
-                                                    .parse::<u64>()
-                                                {
-                                                    total_engine_time += time_ns;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // This is cumulative, so a rough estimate based on recent activity
-                    if total_engine_time > 0 {
-                        // If we see any engine time, assume some baseline activity
-                        utilization = 15.0; // Conservative estimate
-                    }
-                }
-            }
-
-            // Method 5: Use intel_gpu_top if available
-            if utilization == 0.0 {
-                use std::process::Command;
-                if let Ok(output) = Command::new("intel_gpu_top")
-                    .arg("-J")
-                    .arg("-s")
-                    .arg("100")
-                    .output()
-                {
-                    if output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        // Parse JSON output for render/3d engine utilization
-                        if let Some(render_line) = stdout
-                            .lines()
-                            .find(|l| l.contains("\"Render/3D\"") || l.contains("\"render\""))
-                        {
-                            if let Some(busy) = render_line.split(':').nth(1) {
-                                if let Ok(val) = busy.trim().trim_end_matches(',').parse::<f32>() {
-                                    utilization = val;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Get memory info (Intel iGPUs use system RAM, but may have dedicated allocation)
             let mut memory_total = 0u64;
             let mut memory_used = 0u64;
 
-            // Method 1: Try to read lmem (local memory) info for Arc
             let lmem_total_path = device_path.join("lmem_total_bytes");
             if let Ok(total_str) = fs::read_to_string(&lmem_total_path) {
                 memory_total = total_str.trim().parse().unwrap_or(0);
             }
 
-            // Method 2: Check standard vram paths
             if memory_total == 0 {
                 let mem_info_path = device_path.join("mem_info_vram_total");
                 if let Ok(mem_str) = fs::read_to_string(&mem_info_path) {
@@ -686,59 +561,14 @@ impl GpuMonitor {
                 }
             }
 
-            // Method 3: Parse from i915 driver sysfs (most reliable for iGPUs)
-            if memory_total == 0 {
-                // Check for i915_gem_objects debugfs
-                let gem_objects_path =
-                    format!("/sys/kernel/debug/dri/{}/i915_gem_objects", card_name);
-                if let Ok(gem_info) = fs::read_to_string(&gem_objects_path) {
-                    // Parse for total memory info
-                    for line in gem_info.lines() {
-                        if line.contains("total") && line.contains("bytes") {
-                            if let Some(bytes_str) =
-                                line.split_whitespace().find(|s| s.parse::<u64>().is_ok())
-                            {
-                                if let Ok(bytes) = bytes_str.parse::<u64>() {
-                                    memory_total = bytes;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Method 4: Read from i915_gem_gtt for GTT (Graphics Translation Table) size
-            if memory_total == 0 {
-                let gtt_path = format!("/sys/kernel/debug/dri/{}/i915_gem_gtt", card_name);
-                if let Ok(gtt_info) = fs::read_to_string(&gtt_path) {
-                    for line in gtt_info.lines() {
-                        if line.contains("total") || line.contains("size") {
-                            // Extract size in bytes
-                            let parts: Vec<&str> = line.split_whitespace().collect();
-                            for (i, part) in parts.iter().enumerate() {
-                                if part.contains("bytes") && i > 0 {
-                                    if let Ok(bytes) = parts[i - 1].parse::<u64>() {
-                                        memory_total = bytes;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Method 5: For Arc iGPUs, estimate from system RAM (typically can use 50% of system RAM)
             if memory_total == 0 {
                 if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
                     for line in meminfo.lines() {
                         if line.starts_with("MemTotal:") {
                             if let Some(kb_str) = line.split_whitespace().nth(1) {
                                 if let Ok(total_kb) = kb_str.parse::<u64>() {
-                                    // Meteor Lake Arc can use up to 50% of system RAM
                                     memory_total =
-                                        (total_kb * 1024 / 2).max(4 * 1024 * 1024 * 1024); // At least 4GB
+                                        (total_kb * 1024 / 2).max(4 * 1024 * 1024 * 1024);
                                     break;
                                 }
                             }
@@ -747,122 +577,28 @@ impl GpuMonitor {
                 }
             }
 
-            // Get VRAM usage - Multiple methods for accuracy
-            // Method 1: Direct VRAM usage file
             let mem_used_path = device_path.join("mem_info_vram_used");
             if let Ok(used_str) = fs::read_to_string(&mem_used_path) {
                 memory_used = used_str.trim().parse().unwrap_or(0);
             }
 
-            // Method 2: Parse i915_gem_objects for actual usage
-            if memory_used == 0 {
-                let gem_objects_path =
-                    format!("/sys/kernel/debug/dri/{}/i915_gem_objects", card_name);
-                if let Ok(gem_info) = fs::read_to_string(&gem_objects_path) {
-                    let mut total_size = 0u64;
-                    for line in gem_info.lines() {
-                        // Look for object sizes
-                        if line.contains("bytes") && !line.contains("total") {
-                            // Parse individual object sizes and sum them
-                            let parts: Vec<&str> = line.split_whitespace().collect();
-                            for (i, part) in parts.iter().enumerate() {
-                                if *part == "bytes" && i > 0 {
-                                    if let Ok(size) = parts[i - 1].parse::<u64>() {
-                                        total_size += size;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if total_size > 0 {
-                        memory_used = total_size;
-                    }
-                }
-            }
-
-            // Method 3: Read from clients file (shows per-process GPU memory)
-            if memory_used == 0 {
-                let clients_path = format!("/sys/kernel/debug/dri/{}/clients", card_name);
-                if let Ok(clients_info) = fs::read_to_string(&clients_path) {
-                    let mut total_mem = 0u64;
-                    for line in clients_info.lines() {
-                        // Parse memory usage from client info
-                        if line.contains("KiB") {
-                            if let Some(mem_str) = line
-                                .split_whitespace()
-                                .find(|s| s.chars().all(|c| c.is_numeric()))
-                            {
-                                if let Ok(kib) = mem_str.parse::<u64>() {
-                                    total_mem += kib * 1024;
-                                }
-                            }
-                        }
-                    }
-                    if total_mem > 0 {
-                        memory_used = total_mem;
-                    }
-                }
-            }
-
-            // Method 4: Parse /proc/*/fdinfo for drm memory usage (works without debugfs)
-            if memory_used == 0 {
-                let mut total_drm_mem = 0u64;
-                if let Ok(proc_entries) = fs::read_dir("/proc") {
-                    for proc_entry in proc_entries.flatten() {
-                        let fdinfo_path = proc_entry.path().join("fdinfo");
-                        if let Ok(fdinfo_entries) = fs::read_dir(&fdinfo_path) {
-                            for fdinfo_entry in fdinfo_entries.flatten() {
-                                if let Ok(content) = fs::read_to_string(fdinfo_entry.path()) {
-                                    if content.contains("i915") {
-                                        // Look for drm-memory- lines
-                                        for line in content.lines() {
-                                            if line.starts_with("drm-memory-") {
-                                                if let Some(bytes_str) = line.split(':').nth(1) {
-                                                    if let Some(num_str) =
-                                                        bytes_str.trim().split_whitespace().next()
-                                                    {
-                                                        if let Ok(bytes) = num_str.parse::<u64>() {
-                                                            total_drm_mem += bytes;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if total_drm_mem > 0 {
-                    memory_used = total_drm_mem;
-                }
-            }
-
-            // Method 5: Estimate from utilization if we have total but not used
             if memory_used == 0 && memory_total > 0 && utilization > 10.0 {
-                // Conservative estimate: active GPU should be using some VRAM
-                // Use utilization as a rough guide
                 memory_used = ((memory_total as f32 * utilization / 100.0 * 0.3) as u64)
                     .max(512 * 1024 * 1024);
             }
 
-            // Temperature - Enhanced for Arc GPUs
             let mut temperature = None;
             let hwmon_path = device_path.join("hwmon");
 
-            // Try multiple temperature sensors
             if let Ok(hwmon_entries) = fs::read_dir(&hwmon_path) {
                 for hwmon_entry in hwmon_entries.flatten() {
                     let hwmon_dir = hwmon_entry.path();
 
-                    // Try different temperature inputs (Arc GPUs may use different sensors)
                     for temp_num in 1..=5 {
                         let temp_input = hwmon_dir.join(format!("temp{}_input", temp_num));
                         if let Ok(temp_str) = fs::read_to_string(&temp_input) {
                             if let Ok(temp_millidegrees) = temp_str.trim().parse::<f32>() {
                                 let temp_c = temp_millidegrees / 1000.0;
-                                // Sanity check: temperature should be reasonable (0-120°C)
                                 if temp_c > 0.0 && temp_c < 120.0 {
                                     temperature = Some(temp_c);
                                     break;
@@ -877,36 +613,6 @@ impl GpuMonitor {
                 }
             }
 
-            // Fallback: try thermal_zone for Intel
-            if temperature.is_none() {
-                if let Ok(thermal_entries) = fs::read_dir("/sys/class/thermal") {
-                    for thermal_entry in thermal_entries.flatten() {
-                        let thermal_path = thermal_entry.path();
-                        let type_path = thermal_path.join("type");
-
-                        if let Ok(thermal_type) = fs::read_to_string(&type_path) {
-                            // Look for x86_pkg_temp or INT3400 (Intel DPTF)
-                            if thermal_type.trim().contains("x86_pkg_temp")
-                                || thermal_type.trim().contains("INT3400")
-                                || thermal_type.trim().contains("intel")
-                            {
-                                let temp_path = thermal_path.join("temp");
-                                if let Ok(temp_str) = fs::read_to_string(&temp_path) {
-                                    if let Ok(temp_millidegrees) = temp_str.trim().parse::<f32>() {
-                                        let temp_c = temp_millidegrees / 1000.0;
-                                        if temp_c > 0.0 && temp_c < 120.0 {
-                                            temperature = Some(temp_c);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Power usage (if available)
             let mut power_usage = None;
             if let Ok(hwmon_entries) = fs::read_dir(&hwmon_path) {
                 for hwmon_entry in hwmon_entries.flatten() {
@@ -1125,335 +831,6 @@ struct BatteryMonitor {
     charge_history: VecDeque<f32>,
 }
 
-// ================= NPU Monitor =================
-
-struct NpuMonitor {
-    npu_info: Option<NpuInfo>,
-    npu_history: VecDeque<f32>,
-}
-
-impl NpuMonitor {
-    fn new() -> Self {
-        Self {
-            npu_info: None,
-            npu_history: VecDeque::with_capacity(HISTORY_SIZE),
-        }
-    }
-
-    fn refresh(&mut self) {
-        #[cfg(target_os = "linux")]
-        self.refresh_intel_npu_linux();
-
-        #[cfg(target_os = "windows")]
-        self.refresh_intel_npu_windows();
-
-        if let Some(npu) = &self.npu_info {
-            if self.npu_history.len() >= HISTORY_SIZE {
-                self.npu_history.pop_front();
-            }
-            self.npu_history.push_back(npu.utilization);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn refresh_intel_npu_linux(&mut self) {
-        use std::fs;
-
-        // Intel NPU (Neural Processing Unit) for Meteor Lake
-        // Multiple detection paths for Intel VPU/NPU
-        let mut npu_detected = false;
-        let mut npu_base_path: Option<std::path::PathBuf> = None;
-
-        // Method 1: Check for accel devices
-        if let Ok(entries) = fs::read_dir("/sys/class/accel") {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                // Check if it's Intel (vendor 0x8086)
-                let device_path = path.join("device");
-                if let Ok(vendor) = fs::read_to_string(device_path.join("vendor")) {
-                    if vendor.trim() == "0x8086" {
-                        npu_detected = true;
-                        npu_base_path = Some(path);
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Method 2: Check PCI devices for VPU
-        if !npu_detected {
-            let pci_paths = [
-                "/sys/devices/pci0000:00/0000:00:0b.0",
-                "/sys/bus/pci/drivers/intel_vpu",
-            ];
-
-            for pci_path in &pci_paths {
-                let path = std::path::Path::new(pci_path);
-                if path.exists() {
-                    npu_detected = true;
-                    npu_base_path = Some(path.to_path_buf());
-                    break;
-                }
-            }
-        }
-
-        // Method 3: Check for intel_vpu module
-        if !npu_detected {
-            if let Ok(modules) = fs::read_to_string("/proc/modules") {
-                if modules.contains("intel_vpu") {
-                    npu_detected = true;
-                    // Try to find the device path
-                    if let Ok(entries) = fs::read_dir("/sys/module/intel_vpu") {
-                        for entry in entries.flatten() {
-                            if entry.file_name() == "drivers" {
-                                npu_base_path = Some(entry.path());
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !npu_detected {
-            return; // No NPU found
-        }
-
-        let name = "Intel AI Boost (NPU)".to_string();
-
-        let mut utilization = 0.0;
-        let inference_count = 0u64;
-        let mut active_models = Vec::new();
-
-        // PRIMARY METHOD: Scan all processes for NPU usage via fdinfo
-        if let Ok(proc_entries) = fs::read_dir("/proc") {
-            let mut total_npu_engine_ns = 0u64;
-            let mut npu_process_count = 0;
-
-            for proc_entry in proc_entries.flatten() {
-                let proc_name = proc_entry.file_name();
-                let proc_str = proc_name.to_string_lossy();
-
-                // Skip non-numeric (non-process) entries
-                if !proc_str.chars().all(|c| c.is_numeric()) {
-                    continue;
-                }
-
-                let fdinfo_path = proc_entry.path().join("fdinfo");
-                if let Ok(fdinfo_entries) = fs::read_dir(&fdinfo_path) {
-                    let mut found_npu_in_proc = false;
-
-                    for fdinfo_entry in fdinfo_entries.flatten() {
-                        if let Ok(content) = fs::read_to_string(fdinfo_entry.path()) {
-                            // Look for Intel VPU/accel/NPU indicators
-                            let has_vpu = content.contains("intel_vpu")
-                                || content.contains("intel-vpu")
-                                || content.contains("drm-driver:\taccel")
-                                || content.contains("accel/accel");
-
-                            if has_vpu && !found_npu_in_proc {
-                                found_npu_in_proc = true;
-                                npu_process_count += 1;
-
-                                // Try to get process name
-                                if let Ok(cmdline) =
-                                    fs::read_to_string(proc_entry.path().join("cmdline"))
-                                {
-                                    let process_name = cmdline
-                                        .split('\0')
-                                        .next()
-                                        .and_then(|p| p.split('/').last())
-                                        .filter(|s| !s.is_empty())
-                                        .unwrap_or("unknown");
-
-                                    if !active_models.contains(&process_name.to_string()) {
-                                        active_models.push(process_name.to_string());
-                                    }
-                                }
-                            }
-
-                            if has_vpu {
-                                // Parse engine/compute time (in nanoseconds)
-                                for line in content.lines() {
-                                    // Look for various engine time formats
-                                    if line.contains("engine")
-                                        || line.contains("compute")
-                                        || line.contains("drm-engine")
-                                        || line.contains("total-")
-                                    {
-                                        if let Some(time_str) = line.split(':').nth(1) {
-                                            let ns_str = time_str
-                                                .trim()
-                                                .split_whitespace()
-                                                .next()
-                                                .unwrap_or("0");
-
-                                            if let Ok(time_ns) = ns_str.parse::<u64>() {
-                                                total_npu_engine_ns += time_ns;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Calculate utilization based on active processes
-            if npu_process_count > 0 {
-                // Each active process contributes to estimated utilization
-                utilization = (npu_process_count as f32 * 30.0).min(95.0);
-            } else if total_npu_engine_ns > 0 {
-                // Fallback: if we see any engine time at all
-                utilization = 15.0;
-            }
-        }
-
-        // SECONDARY METHOD: Check sysfs for NPU metrics if base path exists
-        if let Some(base_path) = npu_base_path {
-            // Try to read busy/utilization directly
-            let busy_paths = [
-                base_path.join("device/busy"),
-                base_path.join("busy"),
-                base_path.join("device/utilization"),
-            ];
-
-            for busy_path in &busy_paths {
-                if let Ok(busy_str) = fs::read_to_string(busy_path) {
-                    if let Ok(busy_pct) = busy_str.trim().parse::<f32>() {
-                        utilization = utilization.max(busy_pct.clamp(0.0, 100.0));
-                        break;
-                    }
-                }
-            }
-
-            // Read frequency if available
-            let freq_paths = [
-                base_path.join("device/current_frequency"),
-                base_path.join("device/cur_freq"),
-            ];
-
-            let frequency = freq_paths
-                .iter()
-                .find_map(|p| fs::read_to_string(p).ok())
-                .and_then(|s| s.trim().parse::<f32>().ok())
-                .map(|hz| hz / 1_000_000.0); // Convert to MHz
-
-            // Read temperature
-            let mut temperature = None;
-            let hwmon_paths = [base_path.join("device/hwmon"), base_path.join("hwmon")];
-
-            for hwmon_path in &hwmon_paths {
-                if let Ok(hwmon_entries) = fs::read_dir(hwmon_path) {
-                    for hwmon_entry in hwmon_entries.flatten() {
-                        for temp_num in 1..=5 {
-                            let temp_input =
-                                hwmon_entry.path().join(format!("temp{}_input", temp_num));
-                            if let Ok(temp_str) = fs::read_to_string(&temp_input) {
-                                if let Ok(temp_milli) = temp_str.trim().parse::<f32>() {
-                                    let temp_c = temp_milli / 1000.0;
-                                    if temp_c > 0.0 && temp_c < 120.0 {
-                                        temperature = Some(temp_c);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if temperature.is_some() {
-                            break;
-                        }
-                    }
-                    if temperature.is_some() {
-                        break;
-                    }
-                }
-            }
-
-            // Read power usage
-            let mut power_usage = None;
-            for hwmon_path in &hwmon_paths {
-                if let Ok(hwmon_entries) = fs::read_dir(hwmon_path) {
-                    for hwmon_entry in hwmon_entries.flatten() {
-                        let power_paths = [
-                            hwmon_entry.path().join("power1_input"),
-                            hwmon_entry.path().join("power1_average"),
-                        ];
-
-                        for power_path in &power_paths {
-                            if let Ok(power_str) = fs::read_to_string(power_path) {
-                                if let Ok(power_microwatts) = power_str.trim().parse::<f32>() {
-                                    power_usage = Some(power_microwatts / 1_000_000.0);
-                                    break;
-                                }
-                            }
-                        }
-                        if power_usage.is_some() {
-                            break;
-                        }
-                    }
-                    if power_usage.is_some() {
-                        break;
-                    }
-                }
-            }
-
-            self.npu_info = Some(NpuInfo {
-                name,
-                utilization,
-                power_usage,
-                temperature,
-                frequency,
-                inference_count: if inference_count > 0 {
-                    Some(inference_count)
-                } else {
-                    None
-                },
-                active_models,
-            });
-        } else {
-            // Fallback: create NPU info even without full path
-            self.npu_info = Some(NpuInfo {
-                name,
-                utilization,
-                power_usage: None,
-                temperature: None,
-                frequency: None,
-                inference_count: None,
-                active_models,
-            });
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn refresh_intel_npu_windows(&mut self) {
-        // Windows NPU monitoring would require specific APIs
-        // Placeholder for now
-        self.npu_info = Some(NpuInfo {
-            name: "Intel AI Boost (NPU)".to_string(),
-            utilization: 0.0,
-            power_usage: None,
-            temperature: None,
-            frequency: None,
-            inference_count: None,
-            active_models: Vec::new(),
-        });
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    fn refresh_intel_npu_linux(&mut self) {}
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    fn refresh_intel_npu_windows(&mut self) {}
-
-    #[inline]
-    fn has_npu(&self) -> bool {
-        self.npu_info.is_some()
-    }
-}
-
-// ================= Battery Monitor (continuation) =================
-
 impl BatteryMonitor {
     fn new() -> Self {
         let manager = battery::Manager::new().ok();
@@ -1502,7 +879,6 @@ impl BatteryMonitor {
                         None
                     };
 
-                    // Calculate Wh values
                     let capacity_wh = if battery.energy().value > 0.0 {
                         Some(battery.energy().get::<battery::units::energy::watt_hour>())
                     } else {
@@ -1544,13 +920,310 @@ impl BatteryMonitor {
     }
 }
 
-// ================= Battery Monitor =================
+// ================= NPU Monitor =================
 
-struct BatteryMonitor {
-    manager: Option<battery::Manager>,
-    battery_info: Option<BatteryInfo>,
-    charge_history: VecDeque<f32>,
+struct NpuMonitor {
+    npu_info: Option<NpuInfo>,
+    npu_history: VecDeque<f32>,
 }
+
+impl NpuMonitor {
+    fn new() -> Self {
+        Self {
+            npu_info: None,
+            npu_history: VecDeque::with_capacity(HISTORY_SIZE),
+        }
+    }
+
+    fn refresh(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.refresh_intel_npu_linux();
+
+        #[cfg(target_os = "windows")]
+        self.refresh_intel_npu_windows();
+
+        if let Some(npu) = &self.npu_info {
+            if self.npu_history.len() >= HISTORY_SIZE {
+                self.npu_history.pop_front();
+            }
+            self.npu_history.push_back(npu.utilization);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refresh_intel_npu_linux(&mut self) {
+        use std::fs;
+
+        let mut npu_detected = false;
+        let mut npu_base_path: Option<std::path::PathBuf> = None;
+
+        if let Ok(entries) = fs::read_dir("/sys/class/accel") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let device_path = path.join("device");
+                if let Ok(vendor) = fs::read_to_string(device_path.join("vendor")) {
+                    if vendor.trim() == "0x8086" {
+                        npu_detected = true;
+                        npu_base_path = Some(path);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !npu_detected {
+            let pci_paths = [
+                "/sys/devices/pci0000:00/0000:00:0b.0",
+                "/sys/bus/pci/drivers/intel_vpu",
+            ];
+
+            for pci_path in &pci_paths {
+                let path = std::path::Path::new(pci_path);
+                if path.exists() {
+                    npu_detected = true;
+                    npu_base_path = Some(path.to_path_buf());
+                    break;
+                }
+            }
+        }
+
+        if !npu_detected {
+            if let Ok(modules) = fs::read_to_string("/proc/modules") {
+                if modules.contains("intel_vpu") {
+                    npu_detected = true;
+                    if let Ok(entries) = fs::read_dir("/sys/module/intel_vpu") {
+                        for entry in entries.flatten() {
+                            if entry.file_name() == "drivers" {
+                                npu_base_path = Some(entry.path());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !npu_detected {
+            return;
+        }
+
+        let name = "Intel AI Boost (NPU)".to_string();
+
+        let mut utilization = 0.0;
+        let inference_count = 0u64;
+        let mut active_models = Vec::new();
+
+        if let Ok(proc_entries) = fs::read_dir("/proc") {
+            let mut total_npu_engine_ns = 0u64;
+            let mut npu_process_count = 0;
+
+            for proc_entry in proc_entries.flatten() {
+                let proc_name = proc_entry.file_name();
+                let proc_str = proc_name.to_string_lossy();
+
+                if !proc_str.chars().all(|c| c.is_numeric()) {
+                    continue;
+                }
+
+                let fdinfo_path = proc_entry.path().join("fdinfo");
+                if let Ok(fdinfo_entries) = fs::read_dir(&fdinfo_path) {
+                    let mut found_npu_in_proc = false;
+
+                    for fdinfo_entry in fdinfo_entries.flatten() {
+                        if let Ok(content) = fs::read_to_string(fdinfo_entry.path()) {
+                            let has_vpu = content.contains("intel_vpu")
+                                || content.contains("intel-vpu")
+                                || content.contains("drm-driver:\taccel")
+                                || content.contains("accel/accel");
+
+                            if has_vpu && !found_npu_in_proc {
+                                found_npu_in_proc = true;
+                                npu_process_count += 1;
+
+                                if let Ok(cmdline) =
+                                    fs::read_to_string(proc_entry.path().join("cmdline"))
+                                {
+                                    let process_name = cmdline
+                                        .split('\0')
+                                        .next()
+                                        .and_then(|p| p.split('/').last())
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or("unknown");
+
+                                    if !active_models.contains(&process_name.to_string()) {
+                                        active_models.push(process_name.to_string());
+                                    }
+                                }
+                            }
+
+                            if has_vpu {
+                                for line in content.lines() {
+                                    if line.contains("engine")
+                                        || line.contains("compute")
+                                        || line.contains("drm-engine")
+                                        || line.contains("total-")
+                                    {
+                                        if let Some(time_str) = line.split(':').nth(1) {
+                                            let ns_str = time_str
+                                                .trim()
+                                                .split_whitespace()
+                                                .next()
+                                                .unwrap_or("0");
+
+                                            if let Ok(time_ns) = ns_str.parse::<u64>() {
+                                                total_npu_engine_ns += time_ns;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if npu_process_count > 0 {
+                utilization = (npu_process_count as f32 * 30.0).min(95.0);
+            } else if total_npu_engine_ns > 0 {
+                utilization = 15.0;
+            }
+        }
+
+        if let Some(base_path) = npu_base_path {
+            let busy_paths = [
+                base_path.join("device/busy"),
+                base_path.join("busy"),
+                base_path.join("device/utilization"),
+            ];
+
+            for busy_path in &busy_paths {
+                if let Ok(busy_str) = fs::read_to_string(busy_path) {
+                    if let Ok(busy_pct) = busy_str.trim().parse::<f32>() {
+                        utilization = utilization.max(busy_pct.clamp(0.0, 100.0));
+                        break;
+                    }
+                }
+            }
+
+            let freq_paths = [
+                base_path.join("device/current_frequency"),
+                base_path.join("device/cur_freq"),
+            ];
+
+            let frequency = freq_paths
+                .iter()
+                .find_map(|p| fs::read_to_string(p).ok())
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .map(|hz| hz / 1_000_000.0);
+
+            let mut temperature = None;
+            let hwmon_paths = [base_path.join("device/hwmon"), base_path.join("hwmon")];
+
+            for hwmon_path in &hwmon_paths {
+                if let Ok(hwmon_entries) = fs::read_dir(hwmon_path) {
+                    for hwmon_entry in hwmon_entries.flatten() {
+                        for temp_num in 1..=5 {
+                            let temp_input =
+                                hwmon_entry.path().join(format!("temp{}_input", temp_num));
+                            if let Ok(temp_str) = fs::read_to_string(&temp_input) {
+                                if let Ok(temp_milli) = temp_str.trim().parse::<f32>() {
+                                    let temp_c = temp_milli / 1000.0;
+                                    if temp_c > 0.0 && temp_c < 120.0 {
+                                        temperature = Some(temp_c);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if temperature.is_some() {
+                            break;
+                        }
+                    }
+                    if temperature.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            let mut power_usage = None;
+            for hwmon_path in &hwmon_paths {
+                if let Ok(hwmon_entries) = fs::read_dir(hwmon_path) {
+                    for hwmon_entry in hwmon_entries.flatten() {
+                        let power_paths = [
+                            hwmon_entry.path().join("power1_input"),
+                            hwmon_entry.path().join("power1_average"),
+                        ];
+
+                        for power_path in &power_paths {
+                            if let Ok(power_str) = fs::read_to_string(power_path) {
+                                if let Ok(power_microwatts) = power_str.trim().parse::<f32>() {
+                                    power_usage = Some(power_microwatts / 1_000_000.0);
+                                    break;
+                                }
+                            }
+                        }
+                        if power_usage.is_some() {
+                            break;
+                        }
+                    }
+                    if power_usage.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            self.npu_info = Some(NpuInfo {
+                name,
+                utilization,
+                power_usage,
+                temperature,
+                frequency,
+                inference_count: if inference_count > 0 {
+                    Some(inference_count)
+                } else {
+                    None
+                },
+                active_models,
+            });
+        } else {
+            self.npu_info = Some(NpuInfo {
+                name,
+                utilization,
+                power_usage: None,
+                temperature: None,
+                frequency: None,
+                inference_count: None,
+                active_models,
+            });
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn refresh_intel_npu_windows(&mut self) {
+        self.npu_info = Some(NpuInfo {
+            name: "Intel AI Boost (NPU)".to_string(),
+            utilization: 0.0,
+            power_usage: None,
+            temperature: None,
+            frequency: None,
+            inference_count: None,
+            active_models: Vec::new(),
+        });
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn refresh_intel_npu_linux(&mut self) {}
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn refresh_intel_npu_windows(&mut self) {}
+
+    #[inline]
+    fn has_npu(&self) -> bool {
+        self.npu_info.is_some()
+    }
+}
+
+// ================= System Monitor =================
 
 struct SystemMonitor {
     system: System,
@@ -1588,7 +1261,6 @@ impl SystemMonitor {
             .map(|cpu| cpu.brand().to_string())
             .unwrap_or_else(|| "Unknown CPU".to_string());
 
-        // Get CPU frequencies
         let (base_freq, max_freq) = Self::read_cpu_frequencies();
 
         let cpu_info = CpuInfo {
@@ -1659,7 +1331,6 @@ impl SystemMonitor {
         self.system.refresh_cpu_all();
         self.system.refresh_memory();
 
-        // Update CPU stats with frequency and temperature
         for (i, cpu) in self.system.cpus().iter().enumerate() {
             let usage = cpu.cpu_usage().clamp(0.0, 100.0);
             if let Some(history) = self.cpu_history.get_mut(i) {
@@ -1669,7 +1340,6 @@ impl SystemMonitor {
                 history.push_back(usage);
             }
 
-            // Update per-core stats
             if let Some(core_stat) = self.cpu_core_stats.get_mut(i) {
                 core_stat.usage = usage;
                 core_stat.frequency = Self::read_core_frequency(i);
@@ -1677,7 +1347,6 @@ impl SystemMonitor {
             }
         }
 
-        // Update package temperature
         self.cpu_package_temp = Self::read_package_temperature();
 
         let mem_usage = self.memory_usage_percent();
@@ -1708,7 +1377,6 @@ impl SystemMonitor {
     #[cfg(target_os = "linux")]
     fn read_core_temperature(core: usize) -> Option<f32> {
         use std::fs;
-        // Try reading from coretemp
         let hwmon_path = format!("/sys/devices/platform/coretemp.0/hwmon");
         if let Ok(hwmon_entries) = fs::read_dir(&hwmon_path) {
             for hwmon_entry in hwmon_entries.flatten() {
@@ -1735,7 +1403,6 @@ impl SystemMonitor {
     fn read_package_temperature() -> Option<f32> {
         use std::fs;
 
-        // Method 1: Try coretemp package temp
         let hwmon_path = "/sys/devices/platform/coretemp.0/hwmon";
         if let Ok(hwmon_entries) = fs::read_dir(&hwmon_path) {
             for hwmon_entry in hwmon_entries.flatten() {
@@ -1750,7 +1417,6 @@ impl SystemMonitor {
             }
         }
 
-        // Method 2: Try thermal_zone
         if let Ok(thermal_entries) = fs::read_dir("/sys/class/thermal") {
             for thermal_entry in thermal_entries.flatten() {
                 let type_path = thermal_entry.path().join("type");
@@ -1982,11 +1648,9 @@ impl SystemMonitor {
                     egui::vec2(content_width, ui.available_height()),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
-                        // HEADER
                         self.render_header(ui);
                         ui.add_space(32.0);
 
-                        // METRICS IN A 2x2 GRID
                         let metric_spacing = 20.0;
                         let metric_width = (content_width - metric_spacing) / 2.0;
 
@@ -2044,26 +1708,22 @@ impl SystemMonitor {
 
                         ui.add_space(32.0);
 
-                        // BATTERY (FULL WIDTH)
                         if self.battery_monitor.has_battery() {
                             self.render_battery_card(ui);
                             ui.add_space(32.0);
                         }
 
-                        // THREE COLUMN LAYOUT
                         let col_spacing = 20.0;
                         let col_width = (content_width - (col_spacing * 2.0)) / 3.0;
 
                         ui.horizontal_top(|ui| {
                             ui.spacing_mut().item_spacing.x = col_spacing;
 
-                            // COLUMN 1 - CPU Details
                             ui.vertical(|ui| {
                                 ui.set_width(col_width);
                                 self.render_cpu_card(ui);
                             });
 
-                            // COLUMN 2 - Memory & GPU
                             ui.vertical(|ui| {
                                 ui.set_width(col_width);
                                 self.render_memory_card(ui);
@@ -2076,7 +1736,6 @@ impl SystemMonitor {
                                 }
                             });
 
-                            // COLUMN 3 - Processes & Storage
                             ui.vertical(|ui| {
                                 ui.set_width(col_width);
                                 self.render_process_card(ui);
@@ -2162,130 +1821,6 @@ impl SystemMonitor {
                         }
                     }
                 });
-            });
-    }
-
-    fn render_stats_grid(&self, ui: &mut egui::Ui, layout: LayoutMode) {
-        let columns = layout.stats_columns();
-        let spacing = 20.0;
-        let available = ui.available_width();
-        let total_spacing = spacing * (columns - 1) as f32;
-        let card_width = (available - total_spacing) / columns as f32;
-
-        let cpu_usage = self.avg_cpu_usage();
-        let mem_usage = self.memory_usage_percent();
-        let gpu_usage = self
-            .gpu_monitor
-            .get_discrete_gpus()
-            .first()
-            .map(|g| g.utilization)
-            .unwrap_or(0.0);
-
-        // COMPLETELY NEW GRID LAYOUT
-        egui::Grid::new("stats_grid")
-            .spacing([spacing, spacing])
-            .min_col_width(card_width)
-            .show(ui, |ui| match columns {
-                4 => {
-                    self.render_metric_card(
-                        ui,
-                        card_width,
-                        "CPU",
-                        cpu_usage,
-                        self.get_usage_color(cpu_usage),
-                    );
-                    self.render_metric_card(
-                        ui,
-                        card_width,
-                        "Memory",
-                        mem_usage,
-                        self.get_usage_color(mem_usage),
-                    );
-                    self.render_metric_card(
-                        ui,
-                        card_width,
-                        "Processes",
-                        self.total_processes as f32,
-                        self.theme.accent,
-                    );
-                    if self.gpu_monitor.has_discrete_gpu() {
-                        self.render_metric_card(
-                            ui,
-                            card_width,
-                            "GPU",
-                            gpu_usage,
-                            self.get_usage_color(gpu_usage),
-                        );
-                    }
-                }
-                2 => {
-                    self.render_metric_card(
-                        ui,
-                        card_width,
-                        "CPU",
-                        cpu_usage,
-                        self.get_usage_color(cpu_usage),
-                    );
-                    self.render_metric_card(
-                        ui,
-                        card_width,
-                        "Memory",
-                        mem_usage,
-                        self.get_usage_color(mem_usage),
-                    );
-                    ui.end_row();
-                    self.render_metric_card(
-                        ui,
-                        card_width,
-                        "Processes",
-                        self.total_processes as f32,
-                        self.theme.accent,
-                    );
-                    if self.gpu_monitor.has_discrete_gpu() {
-                        self.render_metric_card(
-                            ui,
-                            card_width,
-                            "GPU",
-                            gpu_usage,
-                            self.get_usage_color(gpu_usage),
-                        );
-                    }
-                }
-                _ => {
-                    self.render_metric_card(
-                        ui,
-                        available,
-                        "CPU",
-                        cpu_usage,
-                        self.get_usage_color(cpu_usage),
-                    );
-                    ui.end_row();
-                    self.render_metric_card(
-                        ui,
-                        available,
-                        "Memory",
-                        mem_usage,
-                        self.get_usage_color(mem_usage),
-                    );
-                    ui.end_row();
-                    self.render_metric_card(
-                        ui,
-                        available,
-                        "Processes",
-                        self.total_processes as f32,
-                        self.theme.accent,
-                    );
-                    if self.gpu_monitor.has_discrete_gpu() {
-                        ui.end_row();
-                        self.render_metric_card(
-                            ui,
-                            available,
-                            "GPU",
-                            gpu_usage,
-                            self.get_usage_color(gpu_usage),
-                        );
-                    }
-                }
             });
     }
 
@@ -2436,56 +1971,6 @@ impl SystemMonitor {
         }
     }
 
-    fn render_two_column_layout(&mut self, ui: &mut egui::Ui, _layout: LayoutMode) {
-        let spacing = 16.0;
-        let available = ui.available_width();
-        let col_width = (available - spacing) / 2.0;
-
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = spacing;
-
-            ui.vertical(|ui| {
-                ui.set_width(col_width);
-                self.render_cpu_card(ui);
-                ui.add_space(20.0);
-                self.render_memory_card(ui);
-                ui.add_space(20.0);
-                if self.gpu_monitor.has_integrated_gpu() || self.gpu_monitor.has_discrete_gpu() {
-                    self.render_gpu_cards(ui);
-                    ui.add_space(20.0);
-                }
-                if self.npu_monitor.has_npu() {
-                    self.render_npu_card(ui);
-                }
-            });
-
-            ui.vertical(|ui| {
-                ui.set_width(col_width);
-                self.render_process_card(ui);
-                ui.add_space(20.0);
-                self.render_disk_card(ui);
-            });
-        });
-    }
-
-    fn render_single_column_layout(&mut self, ui: &mut egui::Ui) {
-        self.render_cpu_card(ui);
-        ui.add_space(20.0);
-        self.render_memory_card(ui);
-        ui.add_space(20.0);
-        self.render_process_card(ui);
-        ui.add_space(20.0);
-        if self.gpu_monitor.has_integrated_gpu() || self.gpu_monitor.has_discrete_gpu() {
-            self.render_gpu_cards(ui);
-            ui.add_space(20.0);
-        }
-        if self.npu_monitor.has_npu() {
-            self.render_npu_card(ui);
-            ui.add_space(20.0);
-        }
-        self.render_disk_card(ui);
-    }
-
     fn render_cpu_card(&self, ui: &mut egui::Ui) {
         self.render_card(ui, |ui| {
             ui.label(
@@ -2503,7 +1988,6 @@ impl SystemMonitor {
             );
             ui.add_space(4.0);
 
-            // CPU info - compact
             let mut info_parts = vec![format!(
                 "{} cores · {} threads",
                 self.cpu_info.physical_cores, self.cpu_info.logical_cores
@@ -2941,7 +2425,6 @@ impl SystemMonitor {
 
                 ui.add_space(14.0);
 
-                // Active models/processes
                 if !npu.active_models.is_empty() {
                     ui.label(
                         egui::RichText::new("Active AI Workloads")
@@ -2981,7 +2464,6 @@ impl SystemMonitor {
                     ui.add_space(14.0);
                 }
 
-                // Metrics row
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 16.0;
 
