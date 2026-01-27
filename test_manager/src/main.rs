@@ -14,17 +14,17 @@ use nvml_wrapper::Nvml;
 
 const HISTORY_SIZE: usize = 120;
 const FAST_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
-const SLOW_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SLOW_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const INITIAL_CPU_SAMPLE_DELAY: Duration = Duration::from_millis(200);
 
-const CARD_ROUNDING: f32 = 20.0;
-const INNER_CARD_ROUNDING: f32 = 12.0;
+const CARD_ROUNDING: f32 = 16.0;
+const INNER_CARD_ROUNDING: f32 = 10.0;
 const MAX_CONTENT_WIDTH: f32 = 1400.0;
-const SIDE_PADDING: f32 = 60.0;
+const SIDE_PADDING: f32 = 40.0;
 
 const TOP_PROCESS_COUNT: usize = 10;
-const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
-const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
+const BYTES_PER_MB: f64 = 1_000_000.0;
+const BYTES_PER_GB: f64 = 1_000_000_000.0;
 
 const HIGH_USAGE_THRESHOLD: f32 = 85.0;
 const MEDIUM_USAGE_THRESHOLD: f32 = 60.0;
@@ -236,7 +236,6 @@ struct NpuInfo {
     power_usage: Option<f32>,
     temperature: Option<f32>,
     frequency: Option<f32>,
-    inference_count: Option<u64>,
     active_models: Vec<String>,
 }
 
@@ -275,10 +274,10 @@ impl GpuMonitor {
         }
 
         #[cfg(target_os = "linux")]
-        self.refresh_amd_gpu_linux();
-
-        #[cfg(target_os = "linux")]
-        self.refresh_intel_gpu_linux();
+        {
+            self.refresh_amd_gpu_linux();
+            self.refresh_intel_gpu_linux();
+        }
 
         #[cfg(target_os = "windows")]
         self.refresh_intel_gpu_windows();
@@ -318,15 +317,18 @@ impl GpuMonitor {
                 let stdout = String::from_utf8_lossy(&output.stdout);
 
                 for line in stdout.lines().skip(2) {
-                    if line.contains("intel") || line.contains("Intel") {
+                    if line.to_lowercase().contains("intel") {
                         let parts: Vec<&str> = line.split(',').collect();
                         if parts.len() >= 2 {
                             if let Ok(util) = parts[1].trim().trim_matches('"').parse::<f32>() {
-                                if !self
+                                let util = util.clamp(0.0, 100.0);
+                                if let Some(gpu) = self
                                     .gpus
-                                    .iter()
-                                    .any(|g| g.name.contains("Intel") && g.is_integrated)
+                                    .iter_mut()
+                                    .find(|g| g.name.contains("Intel") && g.is_integrated)
                                 {
+                                    gpu.utilization = util;
+                                } else {
                                     self.gpus.push(GpuInfo {
                                         name: "Intel Integrated Graphics".to_string(),
                                         utilization: util,
@@ -336,14 +338,6 @@ impl GpuMonitor {
                                         power_usage: None,
                                         is_integrated: true,
                                     });
-                                } else {
-                                    if let Some(gpu) = self
-                                        .gpus
-                                        .iter_mut()
-                                        .find(|g| g.name.contains("Intel") && g.is_integrated)
-                                    {
-                                        gpu.utilization = util;
-                                    }
                                 }
                                 break;
                             }
@@ -373,8 +367,7 @@ impl GpuMonitor {
 
             let vendor_path = path.join("device/vendor");
             if let Ok(vendor) = fs::read_to_string(&vendor_path) {
-                let vendor = vendor.trim();
-                if vendor != "0x8086" {
+                if vendor.trim() != "0x8086" {
                     continue;
                 }
             } else {
@@ -384,29 +377,14 @@ impl GpuMonitor {
             let device_path = path.join("device");
             let device_id = fs::read_to_string(device_path.join("device"))
                 .ok()
-                .and_then(|s| s.trim().to_string().into());
+                .map(|s| s.trim().to_string());
 
             let name = if let Some(dev_id) = device_id.as_ref() {
                 match dev_id.as_str() {
                     "0x7d45" | "0x7d55" | "0x7dd5" => {
                         "Intel Arc Graphics (Meteor Lake)".to_string()
                     }
-                    _ => {
-                        if let Ok(uevent) = fs::read_to_string(device_path.join("uevent")) {
-                            uevent
-                                .lines()
-                                .find(|l| l.starts_with("PCI_ID="))
-                                .map(|l| {
-                                    format!(
-                                        "Intel Graphics ({})",
-                                        l.split('=').nth(1).unwrap_or("Unknown")
-                                    )
-                                })
-                                .unwrap_or_else(|| "Intel Integrated Graphics".to_string())
-                        } else {
-                            "Intel Integrated Graphics".to_string()
-                        }
-                    }
+                    _ => "Intel Integrated Graphics".to_string(),
                 }
             } else {
                 "Intel Integrated Graphics".to_string()
@@ -417,13 +395,9 @@ impl GpuMonitor {
             }
 
             let mut utilization = 0.0;
-            let mut utilization_found = false;
-
-            let card_name = card_path.strip_prefix("/sys/class/drm/").unwrap_or("card0");
             let time_delta = self.last_update.elapsed().as_secs_f32().max(0.01);
 
             let mut total_engine_ns = 0u64;
-            let mut process_count = 0;
 
             if let Ok(proc_entries) = fs::read_dir("/proc") {
                 for proc_entry in proc_entries.flatten() {
@@ -444,7 +418,6 @@ impl GpuMonitor {
                                                 {
                                                     if let Ok(time_ns) = ns_str.parse::<u64>() {
                                                         total_engine_ns += time_ns;
-                                                        process_count += 1;
                                                     }
                                                 }
                                             }
@@ -459,17 +432,11 @@ impl GpuMonitor {
 
             let gpu_index = self.gpus.iter().filter(|g| g.is_integrated).count();
 
-            if let Some(last_time) = self.last_gpu_times.get(gpu_index) {
-                if *last_time > 0 && total_engine_ns > *last_time {
+            if let Some(&last_time) = self.last_gpu_times.get(gpu_index) {
+                if last_time > 0 && total_engine_ns > last_time {
                     let time_delta_ns = total_engine_ns - last_time;
-                    let time_delta_secs = time_delta;
-
                     let gpu_time_secs = time_delta_ns as f32 / 1_000_000_000.0;
-                    utilization = (gpu_time_secs / time_delta_secs * 100.0).clamp(0.0, 100.0);
-
-                    if utilization > 1.0 {
-                        utilization_found = true;
-                    }
+                    utilization = (gpu_time_secs / time_delta * 100.0).clamp(0.0, 100.0);
                 }
             }
 
@@ -479,7 +446,7 @@ impl GpuMonitor {
                 self.last_gpu_times.push(total_engine_ns);
             }
 
-            if !utilization_found || utilization < 5.0 {
+            if utilization < 5.0 {
                 let gt_tile_path = device_path.join("gt/gt0");
                 if gt_tile_path.exists() {
                     let freq_act_path = gt_tile_path.join("freq_act");
@@ -503,88 +470,60 @@ impl GpuMonitor {
                                 .and_then(|s| s.trim().parse::<f32>().ok())
                                 .unwrap_or(2000.0);
 
-                            if act > min + 50.0 {
-                                let base_pct =
+                            if act > min + 50.0 && max > min {
+                                let freq_util =
                                     ((act - min) / (max - min) * 100.0).clamp(0.0, 100.0);
-
-                                let freq_util = if base_pct < 10.0 {
-                                    base_pct * 3.0
-                                } else if base_pct < 30.0 {
-                                    base_pct * 2.5
-                                } else if base_pct < 50.0 {
-                                    base_pct * 2.0
-                                } else {
-                                    base_pct * 1.5
-                                };
-
-                                utilization = utilization.max(freq_util.min(100.0));
-                                if utilization > 5.0 {
-                                    utilization_found = true;
-                                }
+                                utilization = utilization.max(freq_util);
                             }
                         }
                     }
                 }
-            }
-
-            if !utilization_found || utilization < 5.0 {
-                for engine in ["rcs0", "rcs", "render"] {
-                    let busy_path = format!("/sys/class/drm/{}/engine/{}/busy", card_name, engine);
-                    if let Ok(busy_str) = fs::read_to_string(&busy_path) {
-                        if let Ok(busy_pct) = busy_str.trim().parse::<f32>() {
-                            if busy_pct > 0.0 {
-                                utilization = utilization.max(busy_pct.clamp(0.0, 100.0));
-                                utilization_found = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (process_count > 0 || total_engine_ns > 100_000_000) && utilization < 5.0 {
-                utilization = 15.0;
             }
 
             let mut memory_total = 0u64;
             let mut memory_used = 0u64;
 
-            let lmem_total_path = device_path.join("lmem_total_bytes");
-            if let Ok(total_str) = fs::read_to_string(&lmem_total_path) {
+            if let Ok(total_str) = fs::read_to_string(device_path.join("lmem_total_bytes")) {
                 memory_total = total_str.trim().parse().unwrap_or(0);
             }
 
             if memory_total == 0 {
-                let mem_info_path = device_path.join("mem_info_vram_total");
-                if let Ok(mem_str) = fs::read_to_string(&mem_info_path) {
+                if let Ok(mem_str) = fs::read_to_string(device_path.join("mem_info_vram_total")) {
                     memory_total = mem_str.trim().parse().unwrap_or(0);
                 }
             }
 
-            if memory_total == 0 {
-                if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
-                    for line in meminfo.lines() {
-                        if line.starts_with("MemTotal:") {
-                            if let Some(kb_str) = line.split_whitespace().nth(1) {
-                                if let Ok(total_kb) = kb_str.parse::<u64>() {
-                                    memory_total =
-                                        (total_kb * 1024 / 2).max(4 * 1024 * 1024 * 1024);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            let mem_used_path = device_path.join("mem_info_vram_used");
-            if let Ok(used_str) = fs::read_to_string(&mem_used_path) {
+            if let Ok(used_str) = fs::read_to_string(device_path.join("mem_info_vram_used")) {
                 memory_used = used_str.trim().parse().unwrap_or(0);
             }
 
             if memory_used == 0 && memory_total > 0 && utilization > 10.0 {
                 memory_used = ((memory_total as f32 * utilization / 100.0 * 0.3) as u64)
                     .max(512 * 1024 * 1024);
+            }
+
+            // For integrated GPUs, estimate memory if not available
+            if memory_total == 0 {
+                if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+                    for line in meminfo.lines() {
+                        if line.starts_with("MemTotal:") {
+                            if let Some(kb_str) = line.split_whitespace().nth(1) {
+                                if let Ok(total_kb) = kb_str.parse::<u64>() {
+                                    // Integrated GPUs typically can use up to 50% of system RAM
+                                    memory_total = (total_kb * 1024) / 2;
+                                    // Estimate current usage based on utilization
+                                    if utilization > 5.0 {
+                                        memory_used = ((memory_total as f32 * utilization / 100.0
+                                            * 0.5)
+                                            as u64)
+                                            .max(256 * 1024 * 1024);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             let mut temperature = None;
@@ -599,7 +538,7 @@ impl GpuMonitor {
                         if let Ok(temp_str) = fs::read_to_string(&temp_input) {
                             if let Ok(temp_millidegrees) = temp_str.trim().parse::<f32>() {
                                 let temp_c = temp_millidegrees / 1000.0;
-                                if temp_c > 0.0 && temp_c < 120.0 {
+                                if (0.0..120.0).contains(&temp_c) {
                                     temperature = Some(temp_c);
                                     break;
                                 }
@@ -658,10 +597,11 @@ impl GpuMonitor {
                 let device_path = path.join("device");
                 let vendor_path = device_path.join("vendor");
                 if let Ok(vendor) = fs::read_to_string(&vendor_path) {
-                    let vendor = vendor.trim();
-                    if vendor != "0x1002" {
+                    if vendor.trim() != "0x1002" {
                         continue;
                     }
+                } else {
+                    continue;
                 }
 
                 let name = if let Ok(product_name) =
@@ -678,7 +618,11 @@ impl GpuMonitor {
 
                 let gpu_busy_path = device_path.join("gpu_busy_percent");
                 let utilization = if let Ok(busy_str) = fs::read_to_string(&gpu_busy_path) {
-                    busy_str.trim().parse::<f32>().unwrap_or(0.0)
+                    busy_str
+                        .trim()
+                        .parse::<f32>()
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 100.0)
                 } else {
                     0.0
                 };
@@ -692,16 +636,18 @@ impl GpuMonitor {
                         let temp_input = hwmon_entry.path().join("temp1_input");
                         if let Ok(temp_str) = fs::read_to_string(&temp_input) {
                             if let Ok(temp_millidegrees) = temp_str.trim().parse::<f32>() {
-                                temperature = Some(temp_millidegrees / 1000.0);
-                                break;
+                                let temp_c = temp_millidegrees / 1000.0;
+                                if (0.0..120.0).contains(&temp_c) {
+                                    temperature = Some(temp_c);
+                                    break;
+                                }
                             }
                         }
                     }
                 }
 
-                let power_path = device_path.join("hwmon");
                 let mut power_usage = None;
-                if let Ok(hwmon_entries) = fs::read_dir(&power_path) {
+                if let Ok(hwmon_entries) = fs::read_dir(&temp_path) {
                     for hwmon_entry in hwmon_entries.flatten() {
                         let power_input = hwmon_entry.path().join("power1_average");
                         if let Ok(power_str) = fs::read_to_string(&power_input) {
@@ -783,7 +729,7 @@ impl GpuMonitor {
                 let utilization = device
                     .utilization_rates()
                     .ok()
-                    .map(|u| u.gpu as f32)
+                    .map(|u| (u.gpu as f32).clamp(0.0, 100.0))
                     .unwrap_or(0.0);
                 let temperature = device
                     .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
@@ -957,6 +903,7 @@ impl NpuMonitor {
         let mut npu_detected = false;
         let mut npu_base_path: Option<std::path::PathBuf> = None;
 
+        // Check /sys/class/accel first
         if let Ok(entries) = fs::read_dir("/sys/class/accel") {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -971,30 +918,49 @@ impl NpuMonitor {
             }
         }
 
+        // Check PCI devices
         if !npu_detected {
             let pci_paths = [
                 "/sys/devices/pci0000:00/0000:00:0b.0",
+                "/sys/devices/pci0000:00/0000:00:08.0",
                 "/sys/bus/pci/drivers/intel_vpu",
             ];
 
             for pci_path in &pci_paths {
                 let path = std::path::Path::new(pci_path);
                 if path.exists() {
-                    npu_detected = true;
-                    npu_base_path = Some(path.to_path_buf());
-                    break;
+                    if let Ok(vendor) = fs::read_to_string(path.join("vendor")) {
+                        if vendor.trim() == "0x8086" {
+                            npu_detected = true;
+                            npu_base_path = Some(path.to_path_buf());
+                            break;
+                        }
+                    }
                 }
             }
         }
 
+        // Check kernel modules
         if !npu_detected {
             if let Ok(modules) = fs::read_to_string("/proc/modules") {
-                if modules.contains("intel_vpu") {
+                if modules.contains("intel_vpu") || modules.contains("intel_npu") {
                     npu_detected = true;
-                    if let Ok(entries) = fs::read_dir("/sys/module/intel_vpu") {
-                        for entry in entries.flatten() {
-                            if entry.file_name() == "drivers" {
-                                npu_base_path = Some(entry.path());
+                }
+            }
+        }
+
+        // Check for DRM render nodes
+        if !npu_detected {
+            if let Ok(entries) = fs::read_dir("/dev/dri") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("renderD") {
+                        // Try to identify if this is an NPU device
+                        if let Ok(realpath) = fs::read_link(entry.path()) {
+                            let path_str = realpath.to_string_lossy();
+                            if path_str.contains("accel") || path_str.contains("vpu") {
+                                npu_detected = true;
                                 break;
                             }
                         }
@@ -1004,17 +970,17 @@ impl NpuMonitor {
         }
 
         if !npu_detected {
+            self.npu_info = None;
             return;
         }
 
         let name = "Intel AI Boost (NPU)".to_string();
 
         let mut utilization = 0.0;
-        let inference_count = 0u64;
         let mut active_models = Vec::new();
 
+        // Check for active NPU processes
         if let Ok(proc_entries) = fs::read_dir("/proc") {
-            let mut total_npu_engine_ns = 0u64;
             let mut npu_process_count = 0;
 
             for proc_entry in proc_entries.flatten() {
@@ -1033,6 +999,7 @@ impl NpuMonitor {
                         if let Ok(content) = fs::read_to_string(fdinfo_entry.path()) {
                             let has_vpu = content.contains("intel_vpu")
                                 || content.contains("intel-vpu")
+                                || content.contains("intel_npu")
                                 || content.contains("drm-driver:\taccel")
                                 || content.contains("accel/accel");
 
@@ -1055,28 +1022,6 @@ impl NpuMonitor {
                                     }
                                 }
                             }
-
-                            if has_vpu {
-                                for line in content.lines() {
-                                    if line.contains("engine")
-                                        || line.contains("compute")
-                                        || line.contains("drm-engine")
-                                        || line.contains("total-")
-                                    {
-                                        if let Some(time_str) = line.split(':').nth(1) {
-                                            let ns_str = time_str
-                                                .trim()
-                                                .split_whitespace()
-                                                .next()
-                                                .unwrap_or("0");
-
-                                            if let Ok(time_ns) = ns_str.parse::<u64>() {
-                                                total_npu_engine_ns += time_ns;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -1084,40 +1029,31 @@ impl NpuMonitor {
 
             if npu_process_count > 0 {
                 utilization = (npu_process_count as f32 * 30.0).min(95.0);
-            } else if total_npu_engine_ns > 0 {
-                utilization = 15.0;
             }
         }
 
-        if let Some(base_path) = npu_base_path {
-            let busy_paths = [
-                base_path.join("device/busy"),
-                base_path.join("busy"),
-                base_path.join("device/utilization"),
-            ];
+        let mut frequency = None;
+        let mut temperature = None;
+        let mut power_usage = None;
 
-            for busy_path in &busy_paths {
-                if let Ok(busy_str) = fs::read_to_string(busy_path) {
-                    if let Ok(busy_pct) = busy_str.trim().parse::<f32>() {
-                        utilization = utilization.max(busy_pct.clamp(0.0, 100.0));
-                        break;
-                    }
-                }
-            }
-
+        if let Some(base_path) = npu_base_path.as_ref() {
             let freq_paths = [
                 base_path.join("device/current_frequency"),
                 base_path.join("device/cur_freq"),
+                base_path.join("gt/gt0/freq_act"),
             ];
 
-            let frequency = freq_paths
+            frequency = freq_paths
                 .iter()
                 .find_map(|p| fs::read_to_string(p).ok())
                 .and_then(|s| s.trim().parse::<f32>().ok())
                 .map(|hz| hz / 1_000_000.0);
 
-            let mut temperature = None;
-            let hwmon_paths = [base_path.join("device/hwmon"), base_path.join("hwmon")];
+            let hwmon_paths = [
+                base_path.join("device/hwmon"),
+                base_path.join("hwmon"),
+                base_path.join("device/device/hwmon"),
+            ];
 
             for hwmon_path in &hwmon_paths {
                 if let Ok(hwmon_entries) = fs::read_dir(hwmon_path) {
@@ -1128,7 +1064,7 @@ impl NpuMonitor {
                             if let Ok(temp_str) = fs::read_to_string(&temp_input) {
                                 if let Ok(temp_milli) = temp_str.trim().parse::<f32>() {
                                     let temp_c = temp_milli / 1000.0;
-                                    if temp_c > 0.0 && temp_c < 120.0 {
+                                    if (0.0..120.0).contains(&temp_c) {
                                         temperature = Some(temp_c);
                                         break;
                                     }
@@ -1145,7 +1081,6 @@ impl NpuMonitor {
                 }
             }
 
-            let mut power_usage = None;
             for hwmon_path in &hwmon_paths {
                 if let Ok(hwmon_entries) = fs::read_dir(hwmon_path) {
                     for hwmon_entry in hwmon_entries.flatten() {
@@ -1171,44 +1106,22 @@ impl NpuMonitor {
                     }
                 }
             }
-
-            self.npu_info = Some(NpuInfo {
-                name,
-                utilization,
-                power_usage,
-                temperature,
-                frequency,
-                inference_count: if inference_count > 0 {
-                    Some(inference_count)
-                } else {
-                    None
-                },
-                active_models,
-            });
-        } else {
-            self.npu_info = Some(NpuInfo {
-                name,
-                utilization,
-                power_usage: None,
-                temperature: None,
-                frequency: None,
-                inference_count: None,
-                active_models,
-            });
         }
+
+        // Always create NPU info if detected, even with 0% utilization
+        self.npu_info = Some(NpuInfo {
+            name,
+            utilization,
+            power_usage,
+            temperature,
+            frequency,
+            active_models,
+        });
     }
 
     #[cfg(target_os = "windows")]
     fn refresh_intel_npu_windows(&mut self) {
-        self.npu_info = Some(NpuInfo {
-            name: "Intel AI Boost (NPU)".to_string(),
-            utilization: 0.0,
-            power_usage: None,
-            temperature: None,
-            frequency: None,
-            inference_count: None,
-            active_models: Vec::new(),
-        });
+        // Windows NPU detection not implemented
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1377,15 +1290,18 @@ impl SystemMonitor {
     #[cfg(target_os = "linux")]
     fn read_core_temperature(core: usize) -> Option<f32> {
         use std::fs;
-        let hwmon_path = format!("/sys/devices/platform/coretemp.0/hwmon");
-        if let Ok(hwmon_entries) = fs::read_dir(&hwmon_path) {
+        let hwmon_path = "/sys/devices/platform/coretemp.0/hwmon";
+        if let Ok(hwmon_entries) = fs::read_dir(hwmon_path) {
             for hwmon_entry in hwmon_entries.flatten() {
                 let temp_input_path = hwmon_entry.path().join(format!("temp{}_input", core + 2));
 
                 if temp_input_path.exists() {
                     if let Ok(temp_str) = fs::read_to_string(&temp_input_path) {
                         if let Ok(temp_milli) = temp_str.trim().parse::<f32>() {
-                            return Some(temp_milli / 1000.0);
+                            let temp_c = temp_milli / 1000.0;
+                            if (0.0..120.0).contains(&temp_c) {
+                                return Some(temp_c);
+                            }
                         }
                     }
                 }
@@ -1404,13 +1320,16 @@ impl SystemMonitor {
         use std::fs;
 
         let hwmon_path = "/sys/devices/platform/coretemp.0/hwmon";
-        if let Ok(hwmon_entries) = fs::read_dir(&hwmon_path) {
+        if let Ok(hwmon_entries) = fs::read_dir(hwmon_path) {
             for hwmon_entry in hwmon_entries.flatten() {
                 let temp_input_path = hwmon_entry.path().join("temp1_input");
                 if temp_input_path.exists() {
                     if let Ok(temp_str) = fs::read_to_string(&temp_input_path) {
                         if let Ok(temp_milli) = temp_str.trim().parse::<f32>() {
-                            return Some(temp_milli / 1000.0);
+                            let temp_c = temp_milli / 1000.0;
+                            if (0.0..120.0).contains(&temp_c) {
+                                return Some(temp_c);
+                            }
                         }
                     }
                 }
@@ -1425,7 +1344,10 @@ impl SystemMonitor {
                         let temp_path = thermal_entry.path().join("temp");
                         if let Ok(temp_str) = fs::read_to_string(&temp_path) {
                             if let Ok(temp_milli) = temp_str.trim().parse::<f32>() {
-                                return Some(temp_milli / 1000.0);
+                                let temp_c = temp_milli / 1000.0;
+                                if (0.0..120.0).contains(&temp_c) {
+                                    return Some(temp_c);
+                                }
                             }
                         }
                     }
@@ -1619,14 +1541,14 @@ impl eframe::App for SystemMonitor {
                     });
             });
 
-        ctx.request_repaint_after(Duration::from_millis(32));
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 
 impl SystemMonitor {
     fn configure_style(&self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(18.0, 18.0);
+        style.spacing.item_spacing = egui::vec2(16.0, 16.0);
         style.spacing.window_margin = egui::Margin::same(0.0);
         style.visuals.widgets.noninteractive.bg_fill = self.theme.bg_card;
         style.visuals.widgets.inactive.bg_fill = self.theme.bg_card;
@@ -1643,15 +1565,15 @@ impl SystemMonitor {
             egui::vec2(available_width, ui.available_height()),
             egui::Layout::top_down(egui::Align::Center),
             |ui| {
-                ui.add_space(40.0);
+                ui.add_space(24.0);
                 ui.allocate_ui_with_layout(
                     egui::vec2(content_width, ui.available_height()),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
                         self.render_header(ui);
-                        ui.add_space(32.0);
+                        ui.add_space(24.0);
 
-                        let metric_spacing = 20.0;
+                        let metric_spacing = 16.0;
                         let metric_width = (content_width - metric_spacing) / 2.0;
 
                         ui.horizontal(|ui| {
@@ -1706,14 +1628,14 @@ impl SystemMonitor {
                             );
                         });
 
-                        ui.add_space(32.0);
+                        ui.add_space(24.0);
 
                         if self.battery_monitor.has_battery() {
                             self.render_battery_card(ui);
-                            ui.add_space(32.0);
+                            ui.add_space(24.0);
                         }
 
-                        let col_spacing = 20.0;
+                        let col_spacing = 16.0;
                         let col_width = (content_width - (col_spacing * 2.0)) / 3.0;
 
                         ui.horizontal_top(|ui| {
@@ -1727,7 +1649,7 @@ impl SystemMonitor {
                             ui.vertical(|ui| {
                                 ui.set_width(col_width);
                                 self.render_memory_card(ui);
-                                ui.add_space(24.0);
+                                ui.add_space(16.0);
 
                                 if self.gpu_monitor.has_integrated_gpu()
                                     || self.gpu_monitor.has_discrete_gpu()
@@ -1739,18 +1661,18 @@ impl SystemMonitor {
                             ui.vertical(|ui| {
                                 ui.set_width(col_width);
                                 self.render_process_card(ui);
-                                ui.add_space(24.0);
+                                ui.add_space(16.0);
 
                                 if self.npu_monitor.has_npu() {
                                     self.render_npu_card(ui);
-                                    ui.add_space(24.0);
+                                    ui.add_space(16.0);
                                 }
 
                                 self.render_disk_card(ui);
                             });
                         });
 
-                        ui.add_space(40.0);
+                        ui.add_space(24.0);
                     },
                 );
             },
@@ -1760,23 +1682,33 @@ impl SystemMonitor {
     fn render_header(&mut self, ui: &mut egui::Ui) {
         egui::Frame::none()
             .fill(self.theme.bg_card)
-            .rounding(20.0)
-            .inner_margin(egui::vec2(32.0, 24.0))
-            .stroke(egui::Stroke::new(1.0, self.theme.border))
+            .rounding(CARD_ROUNDING)
+            .inner_margin(egui::vec2(28.0, 22.0))
+            .stroke(egui::Stroke::new(1.5, self.theme.border))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("System Monitor")
-                                .size(32.0)
-                                .strong()
-                                .color(self.theme.text_primary),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("⚡")
+                                    .size(32.0)
+                                    .color(self.theme.accent),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("System Monitor")
+                                    .size(30.0)
+                                    .strong()
+                                    .color(self.theme.text_primary),
+                            );
+                        });
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new("Real-time system performance")
-                                .size(14.0)
-                                .color(self.theme.text_tertiary),
+                            egui::RichText::new(
+                                "Real-time performance monitoring with accurate metrics",
+                            )
+                            .size(13.0)
+                            .color(self.theme.text_secondary),
                         );
                     });
 
@@ -1789,13 +1721,13 @@ impl SystemMonitor {
 
     fn render_theme_selector(&mut self, ui: &mut egui::Ui) {
         egui::Frame::none()
-            .fill(self.theme.bg_card)
-            .rounding(10.0)
-            .inner_margin(egui::vec2(6.0, 6.0))
+            .fill(self.theme.bg_elevated)
+            .rounding(8.0)
+            .inner_margin(egui::vec2(4.0, 4.0))
             .stroke(egui::Stroke::new(1.0, self.theme.border))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.spacing_mut().item_spacing.x = 4.0;
 
                     let themes = [
                         (ThemeMode::Dark, "🌙"),
@@ -1806,14 +1738,14 @@ impl SystemMonitor {
 
                     for (mode, icon) in themes {
                         let is_selected = self.theme_mode == mode;
-                        let button = egui::Button::new(egui::RichText::new(icon).size(18.0))
+                        let button = egui::Button::new(egui::RichText::new(icon).size(16.0))
                             .fill(if is_selected {
                                 self.theme.accent
                             } else {
-                                self.theme.bg_elevated
+                                self.theme.bg_card
                             })
-                            .rounding(8.0)
-                            .min_size(egui::vec2(40.0, 40.0));
+                            .rounding(6.0)
+                            .min_size(egui::vec2(36.0, 36.0));
 
                         if ui.add(button).clicked() && !is_selected {
                             self.theme_mode = mode;
@@ -1837,22 +1769,37 @@ impl SystemMonitor {
             .rounding(CARD_ROUNDING)
             .inner_margin(16.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
-            .shadow(egui::epaint::Shadow {
-                offset: egui::vec2(0.0, 1.0),
-                blur: 6.0,
-                spread: 0.0,
-                color: egui::Color32::from_black_alpha(25),
-            })
             .show(ui, |ui| {
                 ui.set_width(width - 34.0);
-                ui.set_min_height(90.0);
+                ui.set_min_height(85.0);
                 ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(label.to_uppercase())
-                            .size(9.0)
-                            .strong()
-                            .color(self.theme.text_tertiary),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(label.to_uppercase())
+                                .size(10.0)
+                                .strong()
+                                .color(self.theme.text_tertiary),
+                        );
+
+                        // Add status indicator
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if label != "Processes" {
+                                let indicator_color = if value >= HIGH_USAGE_THRESHOLD {
+                                    self.theme.danger
+                                } else if value >= MEDIUM_USAGE_THRESHOLD {
+                                    self.theme.warning
+                                } else {
+                                    self.theme.success
+                                };
+                                ui.painter().circle_filled(
+                                    ui.cursor().min + egui::vec2(4.0, 4.0),
+                                    3.0,
+                                    indicator_color,
+                                );
+                                ui.add_space(8.0);
+                            }
+                        });
+                    });
                     ui.add_space(8.0);
 
                     let display_text = if label == "Processes" {
@@ -1863,7 +1810,7 @@ impl SystemMonitor {
 
                     ui.label(
                         egui::RichText::new(display_text)
-                            .size(30.0)
+                            .size(28.0)
                             .strong()
                             .color(color),
                     );
@@ -1871,9 +1818,9 @@ impl SystemMonitor {
                     if label != "Processes" {
                         ui.add_space(6.0);
                         let progress = egui::ProgressBar::new(value / 100.0)
-                            .desired_height(4.0)
+                            .desired_height(5.0)
                             .fill(color)
-                            .rounding(2.0);
+                            .rounding(2.5);
                         ui.add(progress);
                     }
                 });
@@ -1887,11 +1834,11 @@ impl SystemMonitor {
                     ui.vertical(|ui| {
                         ui.label(
                             egui::RichText::new("BATTERY")
-                                .size(9.0)
+                                .size(10.0)
                                 .strong()
                                 .color(self.theme.text_tertiary),
                         );
-                        ui.add_space(4.0);
+                        ui.add_space(2.0);
                         let status = if battery.is_charging {
                             "⚡ Charging"
                         } else {
@@ -1907,23 +1854,23 @@ impl SystemMonitor {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("{:.0}%", battery.percentage))
-                                .size(28.0)
+                                .size(24.0)
                                 .strong()
                                 .color(self.get_battery_color(battery.percentage)),
                         );
                     });
                 });
 
-                ui.add_space(12.0);
+                ui.add_space(10.0);
                 let progress = egui::ProgressBar::new(battery.percentage / 100.0)
                     .desired_height(6.0)
                     .fill(self.get_battery_color(battery.percentage))
                     .rounding(3.0);
                 ui.add(progress);
 
-                ui.add_space(16.0);
+                ui.add_space(12.0);
                 ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 18.0;
+                    ui.spacing_mut().item_spacing.x = 16.0;
 
                     if let (Some(current_wh), Some(full_wh)) =
                         (battery.capacity_wh, battery.energy_full_wh)
@@ -1933,7 +1880,7 @@ impl SystemMonitor {
                                 "Capacity: {:.1} / {:.1} Wh",
                                 current_wh, full_wh
                             ))
-                            .size(13.0)
+                            .size(12.0)
                             .color(self.theme.text_secondary),
                         );
                     }
@@ -1946,7 +1893,7 @@ impl SystemMonitor {
                         };
                         ui.label(
                             egui::RichText::new(format!("{} {}", prefix, format_duration(time)))
-                                .size(13.0)
+                                .size(12.0)
                                 .color(self.theme.text_secondary),
                         );
                     }
@@ -1954,7 +1901,7 @@ impl SystemMonitor {
                     if let Some(power) = battery.power_consumption {
                         ui.label(
                             egui::RichText::new(format!("Power: {:.1}W", power))
-                                .size(13.0)
+                                .size(12.0)
                                 .color(self.theme.text_secondary),
                         );
                     }
@@ -1962,7 +1909,7 @@ impl SystemMonitor {
                     if let Some(health) = battery.health {
                         ui.label(
                             egui::RichText::new(format!("Health: {:.0}%", health))
-                                .size(13.0)
+                                .size(12.0)
                                 .color(self.theme.text_secondary),
                         );
                     }
@@ -1973,20 +1920,40 @@ impl SystemMonitor {
 
     fn render_cpu_card(&self, ui: &mut egui::Ui) {
         self.render_card(ui, |ui| {
-            ui.label(
-                egui::RichText::new("CPU")
-                    .size(12.0)
-                    .strong()
-                    .color(self.theme.text_tertiary),
-            );
-            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("CPU")
+                        .size(11.0)
+                        .strong()
+                        .color(self.theme.text_tertiary),
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(temp) = self.cpu_package_temp {
+                        let temp_color = self.get_temp_color(temp);
+                        egui::Frame::none()
+                            .fill(self.theme.bg_elevated)
+                            .rounding(6.0)
+                            .inner_margin(egui::vec2(8.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{}°C", temp as i32))
+                                        .size(11.0)
+                                        .strong()
+                                        .color(temp_color),
+                                );
+                            });
+                    }
+                });
+            });
+            ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(&self.cpu_info.brand)
-                    .size(17.0)
+                    .size(15.0)
                     .strong()
                     .color(self.theme.text_primary),
             );
-            ui.add_space(4.0);
+            ui.add_space(2.0);
 
             let mut info_parts = vec![format!(
                 "{} cores · {} threads",
@@ -1999,23 +1966,19 @@ impl SystemMonitor {
                 info_parts.push(format!("{:.2}-{:.2} GHz", base, max));
             }
 
-            if let Some(temp) = self.cpu_package_temp {
-                info_parts.push(format!("{}°C", temp as i32));
-            }
-
             ui.label(
                 egui::RichText::new(info_parts.join(" · "))
-                    .size(13.0)
+                    .size(11.0)
                     .color(self.theme.text_secondary),
             );
 
-            ui.add_space(18.0);
+            ui.add_space(16.0);
 
             let avg_usage = self.avg_cpu_usage();
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Average Usage")
-                        .size(14.0)
+                        .size(13.0)
                         .color(self.theme.text_secondary),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2029,30 +1992,30 @@ impl SystemMonitor {
             });
             ui.add_space(10.0);
             let progress = egui::ProgressBar::new(avg_usage / 100.0)
-                .desired_height(8.0)
+                .desired_height(7.0)
                 .fill(self.get_usage_color(avg_usage))
-                .rounding(4.0);
+                .rounding(3.5);
             ui.add(progress);
 
-            ui.add_space(18.0);
+            ui.add_space(16.0);
             ui.add(egui::Separator::default().spacing(0.0).horizontal());
-            ui.add_space(18.0);
+            ui.add_space(14.0);
 
-            for (i, history) in self.cpu_history.iter().enumerate() {
-                let current = history.back().copied().unwrap_or(0.0);
+            for (i, _history) in self.cpu_history.iter().enumerate() {
+                let current = self.cpu_core_stats.get(i).map(|s| s.usage).unwrap_or(0.0);
                 let core_stat = self.cpu_core_stats.get(i);
 
                 egui::Frame::none()
                     .fill(self.theme.bg_elevated)
                     .rounding(INNER_CARD_ROUNDING)
-                    .inner_margin(egui::vec2(12.0, 10.0))
+                    .inner_margin(egui::vec2(10.0, 8.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 3.0;
+                                ui.spacing_mut().item_spacing.y = 2.0;
                                 ui.label(
                                     egui::RichText::new(format!("Core {}", i))
-                                        .size(13.0)
+                                        .size(11.0)
                                         .strong()
                                         .color(self.theme.text_primary),
                                 );
@@ -2069,7 +2032,7 @@ impl SystemMonitor {
                                     if !details.is_empty() {
                                         ui.label(
                                             egui::RichText::new(details.join(" · "))
-                                                .size(11.0)
+                                                .size(10.0)
                                                 .color(self.theme.text_tertiary),
                                         );
                                     }
@@ -2081,23 +2044,23 @@ impl SystemMonitor {
                                 |ui| {
                                     ui.label(
                                         egui::RichText::new(format!("{:.0}%", current))
-                                            .size(14.0)
+                                            .size(12.0)
                                             .strong()
                                             .color(self.get_usage_color(current)),
                                     );
 
-                                    ui.add_space(12.0);
+                                    ui.add_space(10.0);
 
-                                    let available_width = ui.available_width() - 12.0;
+                                    let available_width = ui.available_width() - 10.0;
                                     ui.allocate_ui_with_layout(
-                                        egui::vec2(available_width, 7.0),
+                                        egui::vec2(available_width, 6.0),
                                         egui::Layout::left_to_right(egui::Align::Center),
                                         |ui| {
                                             let progress = egui::ProgressBar::new(current / 100.0)
                                                 .desired_width(available_width)
-                                                .desired_height(7.0)
+                                                .desired_height(6.0)
                                                 .fill(self.get_usage_color(current))
-                                                .rounding(3.5);
+                                                .rounding(3.0);
                                             ui.add(progress);
                                         },
                                     );
@@ -2107,7 +2070,7 @@ impl SystemMonitor {
                     });
 
                 if i < self.cpu_history.len() - 1 {
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                 }
             }
         });
@@ -2119,7 +2082,7 @@ impl SystemMonitor {
         self.render_card(ui, |ui| {
             ui.label(
                 egui::RichText::new("MEMORY")
-                    .size(9.0)
+                    .size(10.0)
                     .strong()
                     .color(self.theme.text_tertiary),
             );
@@ -2128,18 +2091,19 @@ impl SystemMonitor {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(format!("{:.1}%", usage_pct))
-                        .size(28.0)
+                        .size(26.0)
                         .strong()
                         .color(self.get_usage_color(usage_pct)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!(
-                            "{:.1} / {:.1} GB",
+                            "{:.2} / {:.2} GB",
                             self.memory_used_gb(),
                             self.memory_total_gb()
                         ))
                         .size(12.0)
+                        .strong()
                         .color(self.theme.text_secondary),
                     );
                 });
@@ -2147,17 +2111,17 @@ impl SystemMonitor {
 
             ui.add_space(12.0);
             let progress = egui::ProgressBar::new(usage_pct / 100.0)
-                .desired_height(6.0)
+                .desired_height(7.0)
                 .fill(self.get_usage_color(usage_pct))
-                .rounding(3.0);
+                .rounding(3.5);
             ui.add(progress);
 
-            ui.add_space(16.0);
+            ui.add_space(14.0);
             self.render_chart(
                 ui,
                 &self.memory_history,
                 "memory_chart".to_string(),
-                100.0,
+                85.0,
                 self.theme.accent,
             );
         });
@@ -2168,48 +2132,126 @@ impl SystemMonitor {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("TOP PROCESSES")
-                        .size(12.0)
+                        .size(11.0)
                         .strong()
                         .color(self.theme.text_tertiary),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{} total", self.total_processes))
-                            .size(11.0)
-                            .color(self.theme.text_tertiary),
-                    );
+                    // Add a subtle badge showing process count
+                    egui::Frame::none()
+                        .fill(self.theme.bg_elevated)
+                        .rounding(6.0)
+                        .inner_margin(egui::vec2(8.0, 3.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{} total", self.total_processes))
+                                    .size(10.0)
+                                    .color(self.theme.accent),
+                            );
+                        });
                 });
             });
 
-            ui.add_space(18.0);
+            ui.add_space(16.0);
 
             if self.top_processes.is_empty() {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
+                    ui.add_space(30.0);
                     ui.label(
-                        egui::RichText::new("No process data available")
-                            .size(14.0)
+                        egui::RichText::new("⏳")
+                            .size(32.0)
                             .color(self.theme.text_tertiary),
                     );
-                    ui.add_space(40.0);
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Loading process data...")
+                            .size(12.0)
+                            .color(self.theme.text_tertiary),
+                    );
+                    ui.add_space(30.0);
                 });
             } else {
+                // Add header row
                 egui::Frame::none()
                     .fill(self.theme.bg_elevated)
-                    .rounding(INNER_CARD_ROUNDING)
-                    .inner_margin(2.0)
+                    .rounding(egui::Rounding {
+                        nw: INNER_CARD_ROUNDING,
+                        ne: INNER_CARD_ROUNDING,
+                        sw: 0.0,
+                        se: 0.0,
+                    })
+                    .inner_margin(egui::vec2(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let name_width = ui.available_width() * 0.5;
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(name_width, 14.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Process")
+                                            .size(10.0)
+                                            .strong()
+                                            .color(self.theme.text_tertiary),
+                                    );
+                                },
+                            );
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Memory")
+                                            .size(10.0)
+                                            .strong()
+                                            .color(self.theme.text_tertiary),
+                                    );
+                                    ui.add_space(40.0);
+                                    ui.label(
+                                        egui::RichText::new("CPU")
+                                            .size(10.0)
+                                            .strong()
+                                            .color(self.theme.text_tertiary),
+                                    );
+                                },
+                            );
+                        });
+                    });
+
+                egui::Frame::none()
+                    .fill(self.theme.bg_elevated)
+                    .rounding(egui::Rounding {
+                        nw: 0.0,
+                        ne: 0.0,
+                        sw: INNER_CARD_ROUNDING,
+                        se: INNER_CARD_ROUNDING,
+                    })
+                    .inner_margin(0.0)
                     .show(ui, |ui| {
                         for (i, process) in self.top_processes.iter().enumerate() {
+                            // Alternating row colors for better readability
+                            let row_bg = if i % 2 == 0 {
+                                self.theme.bg_elevated
+                            } else {
+                                egui::Color32::from_rgba_premultiplied(
+                                    self.theme.bg_elevated.r().saturating_sub(3),
+                                    self.theme.bg_elevated.g().saturating_sub(3),
+                                    self.theme.bg_elevated.b().saturating_sub(3),
+                                    self.theme.bg_elevated.a(),
+                                )
+                            };
+
                             egui::Frame::none()
-                                .inner_margin(egui::vec2(14.0, 12.0))
+                                .fill(row_bg)
+                                .inner_margin(egui::vec2(12.0, 10.0))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         let name_width = ui.available_width() * 0.5;
                                         ui.add_sized(
-                                            [name_width, 20.0],
+                                            [name_width, 18.0],
                                             egui::Label::new(
                                                 egui::RichText::new(&process.name)
-                                                    .size(13.0)
+                                                    .size(11.0)
                                                     .color(self.theme.text_primary),
                                             ),
                                         );
@@ -2222,18 +2264,28 @@ impl SystemMonitor {
                                                         "{:.0} MB",
                                                         process.memory_mb()
                                                     ))
-                                                    .size(12.0)
+                                                    .size(11.0)
                                                     .color(self.theme.text_secondary),
                                                 );
                                                 ui.add_space(16.0);
+
+                                                // Add visual indicator for high CPU usage
+                                                let cpu_color = if process.cpu_usage > 50.0 {
+                                                    self.theme.danger
+                                                } else if process.cpu_usage > 25.0 {
+                                                    self.theme.warning
+                                                } else {
+                                                    self.theme.accent
+                                                };
+
                                                 ui.label(
                                                     egui::RichText::new(format!(
                                                         "{:.1}%",
                                                         process.cpu_usage
                                                     ))
-                                                    .size(12.0)
+                                                    .size(11.0)
                                                     .strong()
-                                                    .color(self.theme.accent),
+                                                    .color(cpu_color),
                                                 );
                                             },
                                         );
@@ -2259,7 +2311,7 @@ impl SystemMonitor {
                     .position(|g| g.name == gpu.name && !g.is_integrated)
                     .unwrap_or(idx);
                 self.render_gpu_card(ui, gpu_index, gpu, "DISCRETE GPU");
-                ui.add_space(30.0);
+                ui.add_space(16.0);
             }
         }
 
@@ -2273,7 +2325,7 @@ impl SystemMonitor {
                     .unwrap_or(idx);
                 self.render_gpu_card(ui, gpu_index, gpu, "INTEGRATED GPU");
                 if idx < self.gpu_monitor.get_integrated_gpus().len() - 1 {
-                    ui.add_space(30.0);
+                    ui.add_space(16.0);
                 }
             }
         }
@@ -2281,32 +2333,52 @@ impl SystemMonitor {
 
     fn render_gpu_card(&self, ui: &mut egui::Ui, index: usize, gpu: &GpuInfo, label: &str) {
         self.render_card(ui, |ui| {
-            ui.label(
-                egui::RichText::new(label)
-                    .size(12.0)
-                    .strong()
-                    .color(self.theme.text_tertiary),
-            );
-            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(label)
+                        .size(11.0)
+                        .strong()
+                        .color(self.theme.text_tertiary),
+                );
+
+                // Show type badge
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let badge_text = if gpu.is_integrated { "iGPU" } else { "dGPU" };
+                    let badge_color = if gpu.is_integrated {
+                        self.theme.text_tertiary
+                    } else {
+                        self.theme.accent
+                    };
+
+                    egui::Frame::none()
+                        .fill(self.theme.bg_elevated)
+                        .rounding(4.0)
+                        .inner_margin(egui::vec2(6.0, 2.0))
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new(badge_text).size(9.0).color(badge_color));
+                        });
+                });
+            });
+            ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(&gpu.name)
-                    .size(16.0)
+                    .size(14.0)
                     .strong()
                     .color(self.theme.text_primary),
             );
 
-            ui.add_space(18.0);
+            ui.add_space(16.0);
 
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("GPU Utilization")
-                        .size(13.0)
+                        .size(12.0)
                         .color(self.theme.text_secondary),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new(format!("{:.0}%", gpu.utilization))
-                            .size(19.0)
+                        egui::RichText::new(format!("{:.1}%", gpu.utilization))
+                            .size(18.0)
                             .strong()
                             .color(self.get_usage_color(gpu.utilization)),
                     );
@@ -2314,54 +2386,63 @@ impl SystemMonitor {
             });
             ui.add_space(10.0);
             let progress = egui::ProgressBar::new(gpu.utilization / 100.0)
-                .desired_height(8.0)
+                .desired_height(7.0)
                 .fill(self.get_usage_color(gpu.utilization))
-                .rounding(4.0);
+                .rounding(3.5);
             ui.add(progress);
 
+            // Show VRAM/Shared Memory for all GPUs
             if gpu.memory_total > 0 {
-                ui.add_space(18.0);
+                ui.add_space(16.0);
                 let vram_pct = gpu.memory_usage_percent();
+                let memory_label = if gpu.is_integrated {
+                    "Shared Memory"
+                } else {
+                    "VRAM"
+                };
+
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("VRAM Usage")
-                            .size(13.0)
+                        egui::RichText::new(memory_label)
+                            .size(12.0)
                             .color(self.theme.text_secondary),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!(
-                                "{:.1} / {:.1} GB",
+                                "{:.2} / {:.2} GB ({:.1}%)",
                                 gpu.memory_used_gb(),
-                                gpu.memory_total_gb()
+                                gpu.memory_total_gb(),
+                                vram_pct
                             ))
-                            .size(13.0)
+                            .size(11.0)
+                            .strong()
                             .color(self.theme.text_primary),
                         );
                     });
                 });
-                ui.add_space(10.0);
+                ui.add_space(8.0);
                 let progress = egui::ProgressBar::new(vram_pct / 100.0)
-                    .desired_height(8.0)
+                    .desired_height(6.0)
                     .fill(self.get_usage_color(vram_pct))
-                    .rounding(4.0);
+                    .rounding(3.0);
                 ui.add(progress);
             }
 
-            ui.add_space(16.0);
+            ui.add_space(14.0);
             ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 18.0;
+                ui.spacing_mut().item_spacing.x = 16.0;
                 if let Some(temp) = gpu.temperature {
                     ui.label(
-                        egui::RichText::new(format!("Temp: {:.0}°C", temp))
-                            .size(13.0)
+                        egui::RichText::new(format!("🌡 {:.0}°C", temp))
+                            .size(11.0)
                             .color(self.get_temp_color(temp)),
                     );
                 }
                 if let Some(power) = gpu.power_usage {
                     ui.label(
-                        egui::RichText::new(format!("Power: {:.0}W", power))
-                            .size(13.0)
+                        egui::RichText::new(format!("⚡ {:.1}W", power))
+                            .size(11.0)
                             .color(self.theme.text_secondary),
                     );
                 }
@@ -2369,12 +2450,12 @@ impl SystemMonitor {
 
             if let Some(history) = self.gpu_monitor.gpu_history.get(index) {
                 if !history.is_empty() && history.len() > 1 {
-                    ui.add_space(18.0);
+                    ui.add_space(14.0);
                     self.render_chart(
                         ui,
                         history,
                         format!("gpu_{}", index),
-                        100.0,
+                        85.0,
                         self.theme.accent,
                     );
                 }
@@ -2387,98 +2468,90 @@ impl SystemMonitor {
             self.render_card(ui, |ui| {
                 ui.label(
                     egui::RichText::new("NPU (AI ACCELERATOR)")
-                        .size(11.0)
+                        .size(10.0)
                         .strong()
                         .color(self.theme.text_tertiary),
                 );
-                ui.add_space(4.0);
+                ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(&npu.name)
-                        .size(15.0)
+                        .size(13.0)
                         .strong()
                         .color(self.theme.text_primary),
                 );
 
-                ui.add_space(14.0);
+                ui.add_space(12.0);
 
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("NPU Utilization")
-                            .size(12.0)
+                            .size(11.0)
                             .color(self.theme.text_secondary),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("{:.0}%", npu.utilization))
-                                .size(17.0)
+                                .size(15.0)
                                 .strong()
                                 .color(self.get_usage_color(npu.utilization)),
                         );
                     });
                 });
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 let progress = egui::ProgressBar::new(npu.utilization / 100.0)
-                    .desired_height(6.0)
+                    .desired_height(5.0)
                     .fill(self.get_usage_color(npu.utilization))
-                    .rounding(3.0);
+                    .rounding(2.5);
                 ui.add(progress);
 
-                ui.add_space(14.0);
+                ui.add_space(12.0);
 
                 if !npu.active_models.is_empty() {
                     ui.label(
                         egui::RichText::new("Active AI Workloads")
-                            .size(11.0)
+                            .size(10.0)
                             .color(self.theme.text_tertiary),
                     );
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
 
                     egui::Frame::none()
                         .fill(self.theme.bg_elevated)
                         .rounding(INNER_CARD_ROUNDING)
-                        .inner_margin(egui::vec2(10.0, 8.0))
+                        .inner_margin(egui::vec2(8.0, 6.0))
                         .show(ui, |ui| {
                             for (i, model) in npu.active_models.iter().take(5).enumerate() {
                                 ui.label(
                                     egui::RichText::new(format!("• {}", model))
-                                        .size(11.0)
+                                        .size(10.0)
                                         .color(self.theme.text_primary),
                                 );
                                 if i < npu.active_models.len().min(5) - 1 {
-                                    ui.add_space(4.0);
+                                    ui.add_space(3.0);
                                 }
                             }
                             if npu.active_models.len() > 5 {
-                                ui.add_space(4.0);
+                                ui.add_space(3.0);
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "... and {} more",
                                         npu.active_models.len() - 5
                                     ))
-                                    .size(10.0)
+                                    .size(9.0)
                                     .color(self.theme.text_tertiary),
                                 );
                             }
                         });
 
-                    ui.add_space(14.0);
+                    ui.add_space(12.0);
                 }
 
                 ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 16.0;
-
-                    if let Some(inferences) = npu.inference_count {
-                        ui.label(
-                            egui::RichText::new(format!("Inferences: {}", inferences))
-                                .size(12.0)
-                                .color(self.theme.accent),
-                        );
-                    }
+                    ui.spacing_mut().item_spacing.x = 14.0;
 
                     if let Some(freq) = npu.frequency {
                         ui.label(
                             egui::RichText::new(format!("Freq: {:.0} MHz", freq))
-                                .size(12.0)
+                                .size(11.0)
                                 .color(self.theme.text_secondary),
                         );
                     }
@@ -2486,7 +2559,7 @@ impl SystemMonitor {
                     if let Some(temp) = npu.temperature {
                         ui.label(
                             egui::RichText::new(format!("Temp: {:.0}°C", temp))
-                                .size(12.0)
+                                .size(11.0)
                                 .color(self.get_temp_color(temp)),
                         );
                     }
@@ -2494,7 +2567,7 @@ impl SystemMonitor {
                     if let Some(power) = npu.power_usage {
                         ui.label(
                             egui::RichText::new(format!("Power: {:.1}W", power))
-                                .size(12.0)
+                                .size(11.0)
                                 .color(self.theme.text_secondary),
                         );
                     }
@@ -2503,12 +2576,12 @@ impl SystemMonitor {
                 if !self.npu_monitor.npu_history.is_empty()
                     && self.npu_monitor.npu_history.len() > 1
                 {
-                    ui.add_space(14.0);
+                    ui.add_space(12.0);
                     self.render_chart(
                         ui,
                         &self.npu_monitor.npu_history,
                         "npu_chart".to_string(),
-                        90.0,
+                        70.0,
                         self.theme.accent,
                     );
                 }
@@ -2524,7 +2597,7 @@ impl SystemMonitor {
         self.render_card(ui, |ui| {
             ui.label(
                 egui::RichText::new("STORAGE")
-                    .size(9.0)
+                    .size(10.0)
                     .strong()
                     .color(self.theme.text_tertiary),
             );
@@ -2538,18 +2611,29 @@ impl SystemMonitor {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new(&disk.mount_point)
-                                        .size(12.0)
-                                        .strong()
-                                        .color(self.theme.text_primary),
-                                );
+                                ui.horizontal(|ui| {
+                                    let icon = if disk.mount_point.contains("home")
+                                        || disk.mount_point == "/"
+                                    {
+                                        "🏠"
+                                    } else {
+                                        "💾"
+                                    };
+                                    ui.label(egui::RichText::new(icon).size(12.0));
+                                    ui.label(
+                                        egui::RichText::new(&disk.mount_point)
+                                            .size(12.0)
+                                            .strong()
+                                            .color(self.theme.text_primary),
+                                    );
+                                });
                                 ui.add_space(3.0);
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "💾 {} / {}",
+                                        "{} / {} ({:.1}% used)",
                                         format_bytes_to_gb(disk.used_space()),
-                                        format_bytes_to_gb(disk.total_space)
+                                        format_bytes_to_gb(disk.total_space),
+                                        disk.usage_percent
                                     ))
                                     .size(10.0)
                                     .color(self.theme.text_secondary),
@@ -2561,7 +2645,7 @@ impl SystemMonitor {
                                 |ui| {
                                     ui.label(
                                         egui::RichText::new(format!("{:.1}%", disk.usage_percent))
-                                            .size(14.0)
+                                            .size(13.0)
                                             .strong()
                                             .color(self.get_usage_color(disk.usage_percent)),
                                     );
@@ -2601,7 +2685,7 @@ impl SystemMonitor {
         egui::Frame::none()
             .fill(self.theme.bg_elevated)
             .rounding(INNER_CARD_ROUNDING)
-            .inner_margin(8.0)
+            .inner_margin(6.0)
             .show(ui, |ui| {
                 Plot::new(id)
                     .height(height)
@@ -2621,8 +2705,8 @@ impl SystemMonitor {
     fn render_card(&self, ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         egui::Frame::none()
             .fill(self.theme.bg_card)
-            .rounding(20.0)
-            .inner_margin(28.0)
+            .rounding(CARD_ROUNDING)
+            .inner_margin(20.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
             .show(ui, add_contents);
     }
