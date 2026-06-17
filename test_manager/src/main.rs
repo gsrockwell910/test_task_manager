@@ -1,7 +1,4 @@
 // ==================== IMPROVED SYSTEM MONITOR - PART 1 OF 2 ====================
-// Copy this entire file content, then append PART 2 content below it
-// Improvements: Fixed AMD Radeon 780M iGPU, Enhanced SSD metrics, UI polish
-
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -263,7 +260,18 @@ struct GpuMonitor {
 impl GpuMonitor {
     fn new() -> Self {
         #[cfg(all(feature = "nvidia", any(target_os = "windows", target_os = "linux")))]
-        let nvml = Nvml::init().ok();
+        let nvml = match Nvml::init() {
+            Ok(n) => {
+                eprintln!("✅ NVML initialized successfully");
+                Some(n)
+            }
+            Err(e) => {
+                eprintln!("❌ NVML initialization failed: {:?}", e);
+                eprintln!("   Make sure NVIDIA drivers are installed and loaded");
+                eprintln!("   Run: nvidia-smi");
+                None
+            }
+        };
 
         Self {
             gpus: Vec::new(),
@@ -625,12 +633,18 @@ impl GpuMonitor {
                 let name = {
                     // First, try to identify by device ID (most reliable)
                     let id_based_name = match device_id.as_str() {
-                        "0x15bf" => Some("AMD Radeon 780M".to_string()),
-                        "0x1900" => Some("AMD Radeon 780M".to_string()), // Your specific 780M ID
-                        "0x15c8" => Some("AMD Radeon 680M".to_string()),
-                        "0x1638" => Some("AMD Radeon 780M".to_string()),
-                        "0x164e" => Some("AMD Radeon RX 7600M XT".to_string()),
-                        "0x1636" => Some("AMD Radeon 660M".to_string()),
+                        "0x1900" => Some("AMD Radeon 890M".to_string()), // 890M
+                        "0x150e" => Some("AMD Radeon 890M".to_string()), // 890M (Strix Point)
+                        "0x15bf" => Some("AMD Radeon 780M".to_string()), // 780M
+                        "0x15c8" => Some("AMD Radeon 680M".to_string()), // 680M
+                        "0x1638" => Some("AMD Radeon 780M".to_string()), // 780M variant
+                        "0x164e" => Some("AMD Radeon RX 7600M XT".to_string()), // Discrete
+                        "0x1636" => Some("AMD Radeon 660M".to_string()), // 660M
+                        "0x164d" => Some("AMD Radeon RX 6600M".to_string()), // 6600M
+                        "0x73bf" => Some("AMD Radeon RX 7600".to_string()), // 7600
+                        "0x1681" => Some("AMD Radeon RX 6700M".to_string()), // 6700M
+                        "0x1506" => Some("AMD Radeon 680M".to_string()), // 680M variant
+                        "0x15e7" => Some("AMD Radeon 660M".to_string()), // 660M variant
                         _ => None,
                     };
 
@@ -643,9 +657,32 @@ impl GpuMonitor {
                         if !trimmed.is_empty() && trimmed != "AMD" && trimmed != "Radeon" {
                             trimmed
                         } else {
-                            // Product name is generic, use device ID if available
-                            if !device_id.is_empty() {
-                                format!("AMD Radeon iGPU ({})", device_id)
+                            // Try using lspci to get a better name
+                            let lspci_name = if let Ok(output) = std::process::Command::new("lspci")
+                                .arg("-d")
+                                .arg(format!("1002:{}", device_id.trim_start_matches("0x")))
+                                .arg("-vmm")
+                                .output()
+                            {
+                                if let Ok(lspci_output) = String::from_utf8(output.stdout) {
+                                    lspci_output
+                                        .lines()
+                                        .find(|line| line.starts_with("Device:"))
+                                        .map(|line| {
+                                            line.trim_start_matches("Device:").trim().to_string()
+                                        })
+                                        .filter(|name| !name.is_empty())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some(name) = lspci_name {
+                                name
+                            } else if !device_id.is_empty() {
+                                format!("AMD Radeon Graphics ({})", device_id)
                             } else {
                                 "AMD Radeon Graphics".to_string()
                             }
@@ -655,7 +692,7 @@ impl GpuMonitor {
                         if let Ok(modalias) = fs::read_to_string(device_path.join("modalias")) {
                             if modalias.contains("1900") || modalias.contains("v00001002d00001900")
                             {
-                                "AMD Radeon 780M".to_string()
+                                "AMD Radeon 890M".to_string()
                             } else if modalias.contains("15bf")
                                 || modalias.contains("v00001002d000015BF")
                             {
@@ -669,12 +706,12 @@ impl GpuMonitor {
                             {
                                 "AMD Radeon 660M".to_string()
                             } else if !device_id.is_empty() {
-                                format!("AMD Radeon iGPU ({})", device_id)
+                                format!("AMD Radeon Graphics ({})", device_id)
                             } else {
                                 "AMD Radeon Graphics".to_string()
                             }
                         } else if !device_id.is_empty() {
-                            format!("AMD Radeon iGPU ({})", device_id)
+                            format!("AMD Radeon Graphics ({})", device_id)
                         } else {
                             "AMD Radeon Graphics".to_string()
                         }
@@ -946,12 +983,21 @@ impl GpuMonitor {
     fn refresh_nvidia_gpus(&mut self) {
         let nvml = match self.nvml.as_ref() {
             Some(n) => n,
-            None => return,
+            None => {
+                eprintln!("⚠️  NVML not initialized, skipping NVIDIA GPU detection");
+                return;
+            }
         };
 
         let device_count = match nvml.device_count() {
-            Ok(count) => count,
-            Err(_) => return,
+            Ok(count) => {
+                eprintln!("🔍 Found {} NVIDIA device(s)", count);
+                count
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to get NVIDIA device count: {:?}", e);
+                return;
+            }
         };
 
         for i in 0..device_count {
@@ -959,6 +1005,8 @@ impl GpuMonitor {
                 let name = device
                     .name()
                     .unwrap_or_else(|_| format!("NVIDIA GPU {}", i));
+
+                eprintln!("   GPU {}: {}", i, name);
 
                 let name_lower = name.to_lowercase();
                 let is_integrated_by_name = name_lower.contains("integrated")
@@ -998,6 +1046,8 @@ impl GpuMonitor {
                     frequency,
                     is_integrated,
                 });
+
+                eprintln!("   ✅ Added to GPU list (integrated: {})", is_integrated);
             }
         }
     }
@@ -1650,6 +1700,8 @@ struct SystemMonitor {
     theme_mode: ThemeMode,
     theme: Theme,
     show_fps: bool,
+    transparent_mode: bool,    // Transparent overlay mode
+    compact_gaming_mode: bool, // Ultra-compact mode for gaming overlay
     frame_times: VecDeque<f32>,
     // Collapse states for all sections
     show_cpu: bool,
@@ -1724,6 +1776,8 @@ impl SystemMonitor {
             theme_mode,
             theme: Theme::from_mode(theme_mode),
             show_fps: false,
+            transparent_mode: false,
+            compact_gaming_mode: false,
             frame_times: VecDeque::with_capacity(60),
             show_cpu: true,
             show_cpu_cores: true,
@@ -2134,47 +2188,99 @@ impl SystemMonitor {
     }
 
     // Process control functions
-    fn stop_process(pid: u32) {
+    fn stop_process(pid: u32) -> bool {
         #[cfg(target_os = "linux")]
         {
             use std::process::Command;
             // Send SIGTERM for graceful shutdown
-            let _ = Command::new("kill")
+            match Command::new("kill")
                 .arg("-15") // SIGTERM
                 .arg(pid.to_string())
-                .output();
+                .output()
+            {
+                Ok(output) => {
+                    if output.status.success() {
+                        eprintln!("✅ Sent SIGTERM to process {}", pid);
+                        true
+                    } else {
+                        eprintln!(
+                            "❌ Failed to stop process {}: {:?}",
+                            pid,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        false
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Error stopping process {}: {}", pid, e);
+                    false
+                }
+            }
         }
 
         #[cfg(target_os = "windows")]
         {
             use std::process::Command;
-            let _ = Command::new("taskkill")
+            match Command::new("taskkill")
                 .arg("/PID")
                 .arg(pid.to_string())
-                .output();
+                .output()
+            {
+                Ok(output) => output.status.success(),
+                Err(_) => false,
+            }
         }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        false
     }
 
-    fn kill_process(pid: u32) {
+    fn kill_process(pid: u32) -> bool {
         #[cfg(target_os = "linux")]
         {
             use std::process::Command;
             // Send SIGKILL for force kill
-            let _ = Command::new("kill")
+            match Command::new("kill")
                 .arg("-9") // SIGKILL
                 .arg(pid.to_string())
-                .output();
+                .output()
+            {
+                Ok(output) => {
+                    if output.status.success() {
+                        eprintln!("✅ Sent SIGKILL to process {}", pid);
+                        true
+                    } else {
+                        eprintln!(
+                            "❌ Failed to kill process {}: {:?}",
+                            pid,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        false
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Error killing process {}: {}", pid, e);
+                    false
+                }
+            }
         }
 
         #[cfg(target_os = "windows")]
         {
             use std::process::Command;
-            let _ = Command::new("taskkill")
+            match Command::new("taskkill")
                 .arg("/F") // Force
                 .arg("/PID")
                 .arg(pid.to_string())
-                .output();
+                .output()
+            {
+                Ok(output) => output.status.success(),
+                Err(_) => false,
+            }
         }
+
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        false
     }
 
     #[inline]
@@ -2312,6 +2418,12 @@ impl eframe::App for SystemMonitor {
             if i.key_pressed(egui::Key::H) {
                 self.show_help = !self.show_help;
             }
+            if i.key_pressed(egui::Key::T) {
+                self.transparent_mode = !self.transparent_mode;
+            }
+            if i.key_pressed(egui::Key::K) {
+                self.compact_gaming_mode = !self.compact_gaming_mode;
+            }
             // Expand/collapse all
             if i.key_pressed(egui::Key::E) {
                 self.show_cpu = true;
@@ -2335,8 +2447,25 @@ impl eframe::App for SystemMonitor {
             }
         });
 
+        // Main content panel background behavior
+        let bg_color = if self.compact_gaming_mode {
+            // In compact mode: T key removes background entirely
+            if self.transparent_mode {
+                egui::Color32::TRANSPARENT // No background at all
+            } else {
+                self.theme.bg_primary // Normal background
+            }
+        } else {
+            // In regular mode: T key makes background semi-transparent
+            if self.transparent_mode {
+                egui::Color32::TRANSPARENT
+            } else {
+                self.theme.bg_primary
+            }
+        };
+
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(self.theme.bg_primary))
+            .frame(egui::Frame::none().fill(bg_color))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -2351,6 +2480,7 @@ impl eframe::App for SystemMonitor {
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .frame(egui::Frame::window(&ctx.style()).fill(self.theme.bg_card)) // Always has solid background
                 .show(ctx, |ui| {
                     ui.set_min_width(300.0);
 
@@ -2419,6 +2549,14 @@ impl eframe::App for SystemMonitor {
                         .num_columns(2)
                         .spacing([20.0, 6.0])
                         .show(ui, |ui| {
+                            ui.label(egui::RichText::new("T").strong().monospace());
+                            ui.label("Toggle transparent mode");
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new("K").strong().monospace());
+                            ui.label("Toggle compact mode");
+                            ui.end_row();
+
                             ui.label(egui::RichText::new("E").strong().monospace());
                             ui.label("Expand all sections");
                             ui.end_row();
@@ -2441,10 +2579,16 @@ impl eframe::App for SystemMonitor {
         }
 
         // BONUS UI TOUCH: Quick Stats Status Bar at bottom with trend indicators
+        let status_bg = if self.transparent_mode {
+            egui::Color32::from_rgba_unmultiplied(20, 20, 25, 180)
+        } else {
+            self.theme.bg_card
+        };
+
         egui::TopBottomPanel::bottom("status_bar")
             .frame(
                 egui::Frame::none()
-                    .fill(self.theme.bg_card)
+                    .fill(status_bg)
                     .inner_margin(egui::vec2(20.0, 10.0)),
             )
             .show(ctx, |ui| {
@@ -2575,16 +2719,220 @@ impl eframe::App for SystemMonitor {
 impl SystemMonitor {
     fn configure_style(&self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
+        let mut visuals = style.visuals.clone();
+
         style.spacing.item_spacing = egui::vec2(16.0, 16.0);
         style.spacing.window_margin = egui::Margin::same(0.0);
-        style.visuals.widgets.noninteractive.bg_fill = self.theme.bg_card;
-        style.visuals.widgets.inactive.bg_fill = self.theme.bg_card;
-        style.visuals.extreme_bg_color = self.theme.bg_secondary;
-        style.visuals.window_shadow = egui::epaint::Shadow::NONE;
+
+        // Compact mode = completely clear window
+        if self.compact_gaming_mode {
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
+            visuals.window_fill = egui::Color32::TRANSPARENT;
+            visuals.panel_fill = egui::Color32::TRANSPARENT;
+            visuals.window_rounding = egui::Rounding::ZERO;
+            visuals.window_stroke = egui::Stroke::NONE;
+            // THIS is the key - clear color for the entire window
+            if self.transparent_mode {
+                ctx.set_visuals(egui::Visuals {
+                    ..egui::Visuals::dark()
+                });
+            }
+        } else if self.transparent_mode {
+            // Regular mode + T pressed = Make cards transparent
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
+        } else {
+            // Normal mode - solid backgrounds
+            visuals.widgets.noninteractive.bg_fill = self.theme.bg_card;
+            visuals.widgets.inactive.bg_fill = self.theme.bg_card;
+            visuals.extreme_bg_color = self.theme.bg_secondary;
+        }
+
+        visuals.window_shadow = egui::epaint::Shadow::NONE;
+        style.visuals = visuals;
         ctx.set_style(style);
     }
 
+    // MSI Afterburner-style compact gaming overlay
+    fn render_compact_gaming_overlay(&mut self, ui: &mut egui::Ui) {
+        // Compact vertical layout
+        ui.vertical(|ui| {
+            ui.set_max_width(220.0);
+
+            // Subtle dark background for compact stats box only
+            let compact_bg = egui::Color32::from_rgba_unmultiplied(8, 8, 12, 200);
+
+            // Ultra-compact frame with stats
+            egui::Frame::none()
+                .fill(compact_bg) // Only the stats box has background
+                .rounding(4.0)
+                .inner_margin(egui::vec2(10.0, 8.0))
+                .show(ui, |ui| {
+                    let text_color = if self.transparent_mode {
+                        egui::Color32::WHITE
+                    } else {
+                        self.theme.text_primary
+                    };
+
+                    // FPS (if enabled)
+                    if self.show_fps && !self.frame_times.is_empty() {
+                        let avg_frame_time: f32 =
+                            self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32;
+                        let fps = if avg_frame_time > 0.0 {
+                            1000.0 / avg_frame_time
+                        } else {
+                            0.0
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("FPS")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(text_color),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{:.0}", fps))
+                                            .size(14.0)
+                                            .strong()
+                                            .color(self.theme.success),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                    }
+
+                    // CPU Usage & Temp
+                    let cpu_usage = self.avg_cpu_usage();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("CPU")
+                                .size(11.0)
+                                .strong()
+                                .color(text_color),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some(temp) = self.cpu_package_temp {
+                                ui.label(
+                                    egui::RichText::new(format!("{}°", temp as i32))
+                                        .size(11.0)
+                                        .color(self.get_temp_color(temp)),
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}%", cpu_usage))
+                                    .size(14.0)
+                                    .strong()
+                                    .color(self.get_usage_color(cpu_usage)),
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+
+                    // GPU Usage & Temp
+                    let discrete_gpus = self.gpu_monitor.get_discrete_gpus();
+                    let integrated_gpus = self.gpu_monitor.get_integrated_gpus();
+                    let gpu = discrete_gpus.first().or_else(|| integrated_gpus.first());
+
+                    if let Some(gpu) = gpu {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("GPU")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(text_color),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if let Some(temp) = gpu.temperature {
+                                        ui.label(
+                                            egui::RichText::new(format!("{}°", temp as i32))
+                                                .size(11.0)
+                                                .color(self.get_temp_color(temp)),
+                                        );
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!("{:.0}%", gpu.utilization))
+                                            .size(14.0)
+                                            .strong()
+                                            .color(self.get_usage_color(gpu.utilization)),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+
+                        // VRAM
+                        let vram_used_gb = gpu.memory_used as f64 / BYTES_PER_GB;
+                        let vram_total_gb = gpu.memory_total as f64 / BYTES_PER_GB;
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("VRAM")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(text_color),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:.1}/{:.0}GB",
+                                            vram_used_gb, vram_total_gb
+                                        ))
+                                        .size(11.0)
+                                        .color(text_color.linear_multiply(0.85)),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                    }
+
+                    // RAM Usage
+                    self.system.refresh_memory();
+                    let ram_used = self.system.used_memory() as f64 / BYTES_PER_GB;
+                    let ram_percent = self.memory_usage_percent();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("RAM")
+                                .size(11.0)
+                                .strong()
+                                .color(text_color),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:.1}GB", ram_used))
+                                    .size(11.0)
+                                    .color(text_color.linear_multiply(0.85)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}%", ram_percent))
+                                    .size(14.0)
+                                    .strong()
+                                    .color(self.get_usage_color(ram_percent)),
+                            );
+                        });
+                    });
+                });
+        });
+    }
+
     fn render_content(&mut self, ui: &mut egui::Ui) {
+        // MSI Afterburner-style compact gaming overlay
+        if self.compact_gaming_mode {
+            self.render_compact_gaming_overlay(ui);
+            return;
+        }
+
         let available_width = ui.available_width();
         let content_width = (available_width - (SIDE_PADDING * 2.0)).min(MAX_CONTENT_WIDTH);
 
@@ -2710,8 +3058,14 @@ impl SystemMonitor {
     }
 
     fn render_header(&mut self, ui: &mut egui::Ui) {
+        let header_bg = if self.transparent_mode {
+            egui::Color32::from_rgba_unmultiplied(20, 20, 25, 200)
+        } else {
+            self.theme.bg_card
+        };
+
         egui::Frame::none()
-            .fill(self.theme.bg_card)
+            .fill(header_bg)
             .rounding(CARD_ROUNDING)
             .inner_margin(egui::vec2(28.0, 22.0))
             .stroke(egui::Stroke::new(1.5, self.theme.border))
@@ -2797,7 +3151,7 @@ impl SystemMonitor {
                                         };
 
                                         egui::Frame::none()
-                                            .fill(self.theme.bg_card)
+                                            .fill(self.get_card_bg())
                                             .rounding(6.0)
                                             .inner_margin(egui::vec2(10.0, 8.0))
                                             .show(ui, |ui| {
@@ -2836,6 +3190,27 @@ impl SystemMonitor {
                                         .clicked()
                                     {
                                         self.show_fps = !self.show_fps;
+                                    }
+
+                                    ui.add_space(4.0);
+
+                                    // Transparent mode toggle button
+                                    let transparent_button =
+                                        egui::Button::new(egui::RichText::new("👁").size(16.0))
+                                            .fill(if self.transparent_mode {
+                                                self.theme.accent
+                                            } else {
+                                                self.theme.bg_card
+                                            })
+                                            .rounding(6.0)
+                                            .min_size(egui::vec2(36.0, 36.0));
+
+                                    if ui
+                                        .add(transparent_button)
+                                        .on_hover_text("Toggle transparent mode\nKeyboard: T")
+                                        .clicked()
+                                    {
+                                        self.transparent_mode = !self.transparent_mode;
                                     }
 
                                     ui.add_space(4.0);
@@ -2906,7 +3281,7 @@ impl SystemMonitor {
         color: egui::Color32,
     ) {
         egui::Frame::none()
-            .fill(self.theme.bg_card)
+            .fill(self.get_card_bg())
             .rounding(CARD_ROUNDING)
             .inner_margin(16.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
@@ -2980,136 +3355,143 @@ impl SystemMonitor {
     }
 
     fn render_battery_card(&mut self, ui: &mut egui::Ui) {
-        // Clone the battery info to avoid borrow checker issues
-        let battery = if let Some(battery) = &self.battery_monitor.battery_info {
-            battery.clone()
-        } else {
-            return;
-        };
+        if let Some(battery) = &self.battery_monitor.battery_info {
+            // Clone data we need to avoid borrow checker issues
+            let battery_percentage = battery.percentage;
+            let is_charging = battery.is_charging;
+            let capacity_wh = battery.capacity_wh;
+            let energy_full_wh = battery.energy_full_wh;
+            let time_remaining = battery.time_remaining;
+            let power_consumption = battery.power_consumption;
+            let health = battery.health;
 
-        egui::Frame::none()
-            .fill(self.theme.bg_card)
-            .rounding(CARD_ROUNDING)
-            .inner_margin(20.0)
-            .stroke(egui::Stroke::new(1.0, self.theme.border))
-            .show(ui, |ui| {
-                // Collapsible header
-                ui.horizontal(|ui| {
-                    let battery_text = if self.show_battery {
-                        "▼ BATTERY"
-                    } else {
-                        "▶ BATTERY"
-                    };
-                    let toggle_button = egui::Button::new(
-                        egui::RichText::new(battery_text)
-                            .size(10.0)
-                            .strong()
-                            .color(self.theme.text_tertiary),
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .frame(false);
+            let show_battery = self.show_battery;
+            let theme = self.theme.clone();
+            let card_bg = self.get_card_bg();
 
-                    if ui.add(toggle_button).clicked() {
-                        self.show_battery = !self.show_battery;
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{:.0}%", battery.percentage))
-                                .size(16.0)
-                                .strong()
-                                .color(self.get_battery_color(battery.percentage)),
-                        );
-                    });
-                });
-
-                if self.show_battery {
-                    ui.add_space(14.0);
-
+            egui::Frame::none()
+                .fill(card_bg)
+                .rounding(CARD_ROUNDING)
+                .inner_margin(20.0)
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .show(ui, |ui| {
+                    // Collapsible header
                     ui.horizontal(|ui| {
-                        let status = if battery.is_charging {
-                            " ⚡ Charging"
+                        let battery_text = if self.show_battery {
+                            "▼ BATTERY"
                         } else {
-                            "🔋 Discharging"
+                            "▶ BATTERY"
                         };
-                        ui.label(
-                            egui::RichText::new(status)
-                                .size(12.0)
-                                .color(self.theme.text_secondary),
-                        );
+                        let toggle_button = egui::Button::new(
+                            egui::RichText::new(battery_text)
+                                .size(10.0)
+                                .strong()
+                                .color(theme.text_tertiary),
+                        )
+                        .fill(egui::Color32::TRANSPARENT)
+                        .frame(false);
+
+                        if ui.add(toggle_button).clicked() {
+                            self.show_battery = !self.show_battery;
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}%", battery_percentage))
+                                    .size(16.0)
+                                    .strong()
+                                    .color(self.get_battery_color(battery_percentage)),
+                            );
+                        });
                     });
 
-                    ui.add_space(10.0);
-                    let progress = egui::ProgressBar::new(battery.percentage / 100.0)
-                        .desired_height(6.0)
-                        .fill(self.get_battery_color(battery.percentage))
-                        .rounding(3.0);
-                    ui.add(progress);
+                    if show_battery {
+                        ui.add_space(14.0);
 
-                    ui.add_space(12.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 16.0;
-
-                        if let (Some(current_wh), Some(full_wh)) =
-                            (battery.capacity_wh, battery.energy_full_wh)
-                        {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Capacity: {:.1} / {:.1} Wh",
-                                    current_wh, full_wh
-                                ))
-                                .size(12.0)
-                                .color(self.theme.text_secondary),
-                            );
-                        }
-
-                        if let Some(time) = battery.time_remaining {
-                            let prefix = if battery.is_charging {
-                                "Time to full:"
+                        ui.horizontal(|ui| {
+                            let status = if is_charging {
+                                " ⚡ Charging"
                             } else {
-                                "Time remaining:"
+                                "🔋 Discharging"
                             };
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "{} {}",
-                                    prefix,
-                                    format_duration(time)
-                                ))
-                                .size(12.0)
-                                .color(self.theme.text_secondary),
-                            );
-                        }
-
-                        if let Some(power) = battery.power_consumption {
-                            ui.label(
-                                egui::RichText::new(format!("Power:  ⚡ {:.1}W", power))
+                                egui::RichText::new(status)
                                     .size(12.0)
-                                    .color(self.theme.text_secondary),
+                                    .color(theme.text_secondary),
                             );
-                        }
+                        });
 
-                        if let Some(health) = battery.health {
-                            let health_color = if health >= 80.0 {
-                                self.theme.success
-                            } else if health >= 60.0 {
-                                self.theme.warning
-                            } else {
-                                self.theme.danger
-                            };
-                            ui.label(
-                                egui::RichText::new(format!("Health: {:.0}%", health))
+                        ui.add_space(10.0);
+                        let progress = egui::ProgressBar::new(battery_percentage / 100.0)
+                            .desired_height(6.0)
+                            .fill(self.get_battery_color(battery_percentage))
+                            .rounding(3.0);
+                        ui.add(progress);
+
+                        ui.add_space(12.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 16.0;
+
+                            if let (Some(current_wh), Some(full_wh)) = (capacity_wh, energy_full_wh)
+                            {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Capacity: {:.1} / {:.1} Wh",
+                                        current_wh, full_wh
+                                    ))
                                     .size(12.0)
-                                    .color(health_color),
-                            );
-                        }
-                    });
-                } // End if show_battery
-            });
+                                    .color(theme.text_secondary),
+                                );
+                            }
+
+                            if let Some(time) = time_remaining {
+                                let prefix = if is_charging {
+                                    "Time to full:"
+                                } else {
+                                    "Time remaining:"
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} {}",
+                                        prefix,
+                                        format_duration(time)
+                                    ))
+                                    .size(12.0)
+                                    .color(theme.text_secondary),
+                                );
+                            }
+
+                            if let Some(power) = power_consumption {
+                                ui.label(
+                                    egui::RichText::new(format!("Power:  ⚡ {:.1}W", power))
+                                        .size(12.0)
+                                        .color(theme.text_secondary),
+                                );
+                            }
+
+                            if let Some(health_val) = health {
+                                let health_color = if health_val >= 80.0 {
+                                    theme.success
+                                } else if health_val >= 60.0 {
+                                    theme.warning
+                                } else {
+                                    theme.danger
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("Health: {:.0}%", health_val))
+                                        .size(12.0)
+                                        .color(health_color),
+                                );
+                            }
+                        });
+                    } // End if show_battery
+                });
+        }
     }
 
     fn render_cpu_card(&mut self, ui: &mut egui::Ui) {
         egui::Frame::none()
-            .fill(self.theme.bg_card)
+            .fill(self.get_card_bg())
             .rounding(CARD_ROUNDING)
             .inner_margin(20.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
@@ -3292,7 +3674,7 @@ impl SystemMonitor {
                                                     if let Some(temp) = stat.temperature {
                                                         let temp_color = self.get_temp_color(temp);
                                                         egui::Frame::none()
-                                                            .fill(self.theme.bg_card)
+                                                            .fill(self.get_card_bg())
                                                             .rounding(4.0)
                                                             .inner_margin(egui::vec2(5.0, 2.0))
                                                             .show(ui, |ui| {
@@ -3357,7 +3739,7 @@ impl SystemMonitor {
         let usage_pct = self.memory_usage_percent();
 
         egui::Frame::none()
-            .fill(self.theme.bg_card)
+            .fill(self.get_card_bg())
             .rounding(CARD_ROUNDING)
             .inner_margin(20.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
@@ -3434,7 +3816,7 @@ impl SystemMonitor {
 
     fn render_process_card(&mut self, ui: &mut egui::Ui) {
         egui::Frame::none()
-            .fill(self.theme.bg_card)
+            .fill(self.get_card_bg())
             .rounding(CARD_ROUNDING)
             .inner_margin(20.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
@@ -3597,28 +3979,32 @@ impl SystemMonitor {
 
                                             // Stop button (SIGTERM)
                                             let stop_btn = egui::Button::new(
-                                                egui::RichText::new("⏹ Stop").size(9.0)  // Square - reliable
+                                                egui::RichText::new("STOP").size(10.0).strong()
                                             )
                                             .fill(self.theme.warning)
-                                            .rounding(4.0)
-                                            .min_size(egui::vec2(50.0, 20.0));
+                                            .rounding(3.0)
+                                            .min_size(egui::vec2(60.0, 24.0));
 
-                                            if ui.add(stop_btn).on_hover_text("Send SIGTERM (graceful shutdown)").clicked() {
-                                                Self::stop_process(process.pid);
+                                            if ui.add(stop_btn).on_hover_text("Send SIGTERM (graceful shutdown)\nRequires permissions").clicked() {
+                                                if Self::stop_process(process.pid) {
+                                                    self.selected_process_pid = None;  // Deselect on success
+                                                }
                                             }
 
-                                            ui.add_space(4.0);
+                                            ui.add_space(6.0);
 
                                             // Kill button (SIGKILL)
                                             let kill_btn = egui::Button::new(
-                                                egui::RichText::new("❌ Kill").size(9.0)  // Multiplication X - reliable
+                                                egui::RichText::new("KILL").size(10.0).strong()
                                             )
                                             .fill(self.theme.danger)
-                                            .rounding(4.0)
-                                            .min_size(egui::vec2(50.0, 20.0));
+                                            .rounding(3.0)
+                                            .min_size(egui::vec2(60.0, 24.0));
 
-                                            if ui.add(kill_btn).on_hover_text("Send SIGKILL (force kill)").clicked() {
-                                                Self::kill_process(process.pid);
+                                            if ui.add(kill_btn).on_hover_text("Send SIGKILL (force terminate)\nRequires permissions").clicked() {
+                                                if Self::kill_process(process.pid) {
+                                                    self.selected_process_pid = None;  // Deselect on success
+                                                }
                                             }
                                         }
 
@@ -3687,7 +4073,7 @@ impl SystemMonitor {
         if !self.show_gpu {
             // Collapsed header
             egui::Frame::none()
-                .fill(self.theme.bg_card)
+                .fill(self.get_card_bg())
                 .rounding(CARD_ROUNDING)
                 .inner_margin(20.0)
                 .stroke(egui::Stroke::new(1.0, self.theme.border))
@@ -3761,7 +4147,7 @@ impl SystemMonitor {
         } else {
             // Show "None detected" for discrete GPU
             egui::Frame::none()
-                .fill(self.theme.bg_card)
+                .fill(self.get_card_bg())
                 .rounding(CARD_ROUNDING)
                 .inner_margin(20.0)
                 .stroke(egui::Stroke::new(1.0, self.theme.border))
@@ -3827,7 +4213,7 @@ impl SystemMonitor {
         is_discrete: bool,
     ) {
         egui::Frame::none()
-            .fill(self.theme.bg_card)
+            .fill(self.get_card_bg())
             .rounding(CARD_ROUNDING)
             .inner_margin(20.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
@@ -4015,7 +4401,7 @@ impl SystemMonitor {
         };
 
         egui::Frame::none()
-            .fill(self.theme.bg_card)
+            .fill(self.get_card_bg())
             .rounding(CARD_ROUNDING)
             .inner_margin(20.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
@@ -4271,7 +4657,7 @@ impl SystemMonitor {
         }
 
         egui::Frame::none()
-            .fill(self.theme.bg_card)
+            .fill(self.get_card_bg())
             .rounding(CARD_ROUNDING)
             .inner_margin(20.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
@@ -4384,7 +4770,7 @@ impl SystemMonitor {
                                             };
 
                                             egui::Frame::none()
-                                                .fill(self.theme.bg_card)
+                                                .fill(self.get_card_bg())
                                                 .rounding(4.0)
                                                 .inner_margin(egui::vec2(6.0, 2.0))
                                                 .show(ui, |ui| {
@@ -4397,7 +4783,7 @@ impl SystemMonitor {
 
                                             if disk.is_removable {
                                                 egui::Frame::none()
-                                                    .fill(self.theme.bg_card)
+                                                    .fill(self.get_card_bg())
                                                     .rounding(4.0)
                                                     .inner_margin(egui::vec2(6.0, 2.0))
                                                     .show(ui, |ui| {
@@ -4515,21 +4901,88 @@ impl SystemMonitor {
 
     #[allow(dead_code)]
     fn render_card(&self, ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+        let card_bg = if self.transparent_mode {
+            // Semi-transparent dark background for readability
+            egui::Color32::from_rgba_unmultiplied(20, 20, 25, 180)
+        } else {
+            self.theme.bg_card
+        };
+
         egui::Frame::none()
-            .fill(self.theme.bg_card)
+            .fill(card_bg)
             .rounding(CARD_ROUNDING)
             .inner_margin(20.0)
             .stroke(egui::Stroke::new(1.0, self.theme.border))
             .show(ui, add_contents);
     }
+
+    fn get_card_bg(&self) -> egui::Color32 {
+        // T key in regular mode = transparent cards
+        if !self.compact_gaming_mode && self.transparent_mode {
+            egui::Color32::TRANSPARENT
+        } else {
+            self.theme.bg_card
+        }
+    }
+
+    #[allow(dead_code)]
+    fn get_card_margin(&self) -> f32 {
+        if self.compact_gaming_mode {
+            8.0 // Compact margins for gaming
+        } else {
+            20.0 // Normal margins
+        }
+    }
+
+    #[allow(dead_code)]
+    fn get_card_spacing(&self) -> f32 {
+        if self.compact_gaming_mode {
+            4.0 // Minimal spacing between elements
+        } else {
+            12.0 // Normal spacing
+        }
+    }
+
+    #[allow(dead_code)]
+    fn get_text_color(&self) -> egui::Color32 {
+        if self.transparent_mode {
+            // Brighter white text with slight shadow effect for gaming overlay readability
+            egui::Color32::from_rgb(255, 255, 255)
+        } else {
+            self.theme.text_primary
+        }
+    }
+
+    #[allow(dead_code)]
+    fn get_secondary_text_color(&self) -> egui::Color32 {
+        if self.transparent_mode {
+            // Bright secondary text for better visibility
+            egui::Color32::from_rgb(220, 220, 225)
+        } else {
+            self.theme.text_secondary
+        }
+    }
 }
 
 fn main() -> Result<(), eframe::Error> {
+    // Compile-time feature check
+    #[cfg(feature = "nvidia")]
+    {
+        eprintln!("✅ COMPILED WITH NVIDIA FEATURE ENABLED");
+    }
+
+    #[cfg(not(feature = "nvidia"))]
+    {
+        eprintln!("❌ WARNING: COMPILED WITHOUT NVIDIA FEATURE!");
+        eprintln!("   Rebuild with: cargo build --release --features nvidia");
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 1000.0])
             .with_min_inner_size([800.0, 800.0])
-            .with_title("System Monitor"),
+            .with_title("System Monitor")
+            .with_transparent(true), // Enable transparency support
         ..Default::default()
     };
 
@@ -4605,6 +5058,13 @@ fn main() -> Result<(), eframe::Error> {
             }
 
             cc.egui_ctx.set_fonts(fonts);
+
+            // Set clear color to fully transparent for proper GNOME compositing
+            cc.egui_ctx.set_visuals(egui::Visuals {
+                window_fill: egui::Color32::TRANSPARENT,
+                panel_fill: egui::Color32::TRANSPARENT,
+                ..egui::Visuals::dark()
+            });
 
             Ok(Box::new(SystemMonitor::new()))
         }),
